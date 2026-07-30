@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +44,12 @@ DUAL_AGENT_DIR = _THIS_FILE.parent
 PROJECT_ROOT = _THIS_FILE.parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from mllm_base_agent.task_sharding import resolve_shard_config, shard_tasks
+from mllm_base_agent.subprocess_streaming import (
+    run_task_subprocess_streaming,
+    write_task_runtime_status,
+)
 
 TASK_FOLDER_ROOT = DUAL_AGENT_DIR / "task_mutil_procthor"
 DEFAULT_BENCHMARK_OUTPUT_DIR = DUAL_AGENT_DIR / "benchmark_outputs"
@@ -740,6 +747,7 @@ def save_failed_snapshot(task_id: str, task_output_dir: str, failed_logs_dir: st
 
 
 def find_completed_tasks(output_dir: str, save_name: Optional[str]) -> Set[str]:
+    """Find completed tasks in both legacy flat and experiment/shard layouts."""
     completed: Set[str] = set()
     root = Path(output_dir)
     if not root.exists():
@@ -747,16 +755,28 @@ def find_completed_tasks(output_dir: str, save_name: Optional[str]) -> Set[str]:
     prefixes = ["dual_benchmark_", "dual_benchmark_sequential_"]
     if save_name:
         prefixes.append(f"{save_name}_")
-    dirs = [d for d in root.iterdir() if d.is_dir() and any(d.name.startswith(p) for p in prefixes)]
-    dirs.sort(key=lambda x: x.name, reverse=True)
-    for bdir in dirs:
-        for task_dir in bdir.iterdir():
-            if not task_dir.is_dir():
-                continue
-            if task_dir.name in {"task_logs", "failed_logs"}:
-                continue
-            if find_result_json(str(task_dir)):
-                completed.add(normalize_task_id(task_dir.name))
+    experiment_dirs = [
+        path for path in root.iterdir()
+        if path.is_dir() and any(path.name.startswith(prefix) for prefix in prefixes)
+    ]
+    experiment_dirs.sort(key=lambda path: path.name, reverse=True)
+    for experiment_dir in experiment_dirs:
+        shard_dirs = sorted(
+            (
+                path for path in experiment_dir.iterdir()
+                if path.is_dir() and path.name.startswith("shard-")
+            ),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+        # Legacy layout stores task directories directly in the experiment directory.
+        run_dirs = shard_dirs or [experiment_dir]
+        for run_dir in run_dirs:
+            for task_dir in run_dir.iterdir():
+                if not task_dir.is_dir() or task_dir.name in {"task_logs", "failed_logs"}:
+                    continue
+                if find_result_json(str(task_dir)):
+                    completed.add(normalize_task_id(task_dir.name))
     return completed
 
 
@@ -801,6 +821,30 @@ def main() -> int:
     )
     parser.add_argument("--csv", type=str, default=None, help="   CSV   ")
     parser.add_argument("--workers", type=int, default=4, help="   worker  ")
+    parser.add_argument(
+        "--task-timeout-seconds",
+        type=int,
+        default=0,
+        help="单个任务超时秒数；0 表示不限制（集群排障建议设置，例如 7200）",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=None,
+        help="跨机器任务分片总数；默认从 TASK_NUM_SHARDS/WORLD_SIZE/AFO 集群信息读取",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help="当前机器的分片编号（从 0 开始）；默认从 TASK_SHARD_INDEX/RANK/AFO 集群信息读取",
+    )
+    parser.add_argument(
+        "--shard-strategy",
+        choices=["round_robin", "contiguous"],
+        default="round_robin",
+        help="任务分片策略：轮询分配（默认，较均衡）或连续区间",
+    )
     parser.add_argument("--config", type=str, default="experiments/configs/procthor/dual/config_close_gpt-5.yaml", help="        ")
     parser.add_argument("--task", type=str, default=None, help="      task_id")
     parser.add_argument("--tasks", type=str, nargs="+", default=None, help="            ")
@@ -823,6 +867,11 @@ def main() -> int:
     parser.add_argument("--sequential", action="store_true", help="      ")
     parser.add_argument("--skip-completed", action="store_true", help="       ")
     parser.add_argument(
+        "--rerun-all",
+        action="store_true",
+        help="重新运行 CSV 中所有任务（包括已标记为 true/false 的任务）；默认只运行 Completed 为空(null) 的任务",
+    )
+    parser.add_argument(
         "--outputs-completed-dir",
         type=str,
         default=str(DEFAULT_OUTPUTS_COMPLETED_DIR),
@@ -831,7 +880,18 @@ def main() -> int:
     parser.add_argument("--save-name", type=str, default=None, help="benchmark       ")
     parser.add_argument("--agent1", type=str, default=None, help="Agent 1       ")
     parser.add_argument("--agent2", type=str, default=None, help="Agent 2       ")
+    parser.add_argument("--history-feedback", action="store_true", help="Inject each step's action + result into per-step history")
+    parser.add_argument("--llm-history-feedback", action="store_true", help="Use a second LLM to annotate recent action/outcome history")
+    parser.add_argument("--image-scale", type=float, default=1.0, help="Downscale factor for images sent to the VLM (0 < scale <= 1.0)")
+    parser.add_argument("--image-recent-steps", type=int, default=0, help="Number of recent history steps kept at original resolution")
+    parser.add_argument("--partner-view", action="store_true", help="Inject the partner body's current first-person image at each step")
+    parser.add_argument("--partner-view-scale", type=float, default=None, help="Downscale factor for the partner-view image (defaults to --image-scale)")
     args = parser.parse_args()
+
+    try:
+        shard_config = resolve_shard_config(args.num_shards, args.shard_index)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     config_path = Path(args.config)
     if not config_path.exists():
@@ -854,11 +914,18 @@ def main() -> int:
         print(f"📋 Explicit task list: {task_ids[:5]}")
     elif csv_path:
         print(f"📋 Reading task IDs from CSV: {csv_path}")
-        task_ids = read_task_ids_from_csv(csv_path, only_null=True)
+        only_null = not args.rerun_all
+        task_ids = read_task_ids_from_csv(csv_path, only_null=only_null)
         if not task_ids:
-            print("❌ No task IDs with Completed=null in CSV")
+            if only_null:
+                print("❌ No task IDs with Completed=null in CSV")
+            else:
+                print("❌ No task IDs found in CSV")
             return 1
-        print(f"✓ Found {len(task_ids)} tasks with Completed=null")
+        if only_null:
+            print(f"✓ Found {len(task_ids)} tasks with Completed=null")
+        else:
+            print(f"✓ Found {len(task_ids)} tasks (rerun-all mode, including completed true/false)")
     else:
         print("❌ Provide one of --csv / --task / --tasks")
         return 1
@@ -867,7 +934,27 @@ def main() -> int:
     if len(task_ids) > 5:
         print(f"  ... (total {len(task_ids)} tasks)")
 
-    if args.skip_completed:
+    task_ids, duplicates = deduplicate_task_ids(task_ids)
+    if duplicates:
+        print(f"⚠️  Found {len(duplicates)} duplicated task IDs; duplicates skipped")
+
+    unsharded_task_count = len(task_ids)
+    task_ids = shard_tasks(task_ids, shard_config, args.shard_strategy)
+    if shard_config.enabled:
+        print(
+            f"🔀 Task shard {shard_config.shard_index}/{shard_config.num_shards} "
+            f"({args.shard_strategy}, source={shard_config.source}): "
+            f"selected {len(task_ids)}/{unsharded_task_count} tasks"
+        )
+
+    if not task_ids:
+        print("✓ This shard has no tasks to run")
+        return 0
+
+    if args.rerun_all and args.skip_completed:
+        print("⚠️  --rerun-all 已启用，忽略 --skip-completed（强制重跑所有任务，不做断点续跑）")
+
+    if args.skip_completed and not args.rerun_all:
         print("\n🔍 Checking completed tasks from previous dual benchmark dirs...")
         completed = find_completed_tasks(args.output_dir, args.save_name)
         if completed:
@@ -880,21 +967,26 @@ def main() -> int:
         else:
             print("✓ No completed tasks found")
 
-    task_ids, duplicates = deduplicate_task_ids(task_ids)
-    if duplicates:
-        print(f"⚠️  Found {len(duplicates)} duplicated task IDs; duplicates skipped")
     if not task_ids:
-        print("❌ No tasks to run")
+        print("✓ All tasks assigned to this shard are completed")
         return 0
 
     actual_config_path, temp_config = prepare_benchmark_config(config_path, args.headless)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = os.environ.get("BENCHMARK_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    if not re.fullmatch(r"\d{8}_\d{6}", timestamp):
+        parser.error("BENCHMARK_RUN_TIMESTAMP must use YYYYMMDD_HHMMSS format")
     if args.save_name:
         prefix = args.save_name
     else:
         prefix = "dual_benchmark_sequential" if args.sequential else "dual_benchmark"
-    benchmark_output_dir = Path(args.output_dir) / f"{prefix}_{timestamp}"
+    experiment_output_dir = Path(args.output_dir) / f"{prefix}_{timestamp}"
+    if shard_config.enabled:
+        # Use one-based shard names for easier operator-facing identification.
+        shard_name = f"shard-{shard_config.shard_index + 1:03d}"
+        benchmark_output_dir = experiment_output_dir / shard_name
+    else:
+        benchmark_output_dir = experiment_output_dir
     benchmark_output_dir.mkdir(parents=True, exist_ok=True)
     task_logs_dir = benchmark_output_dir / "task_logs"
     task_logs_dir.mkdir(parents=True, exist_ok=True)
@@ -902,12 +994,18 @@ def main() -> int:
     failed_logs_dir.mkdir(parents=True, exist_ok=True)
     outputs_completed_path = Path(args.outputs_completed_dir)
     outputs_completed_path.mkdir(parents=True, exist_ok=True)
+    result_csv_path = csv_path
+    if csv_path and shard_config.enabled:
+        result_csv_path = benchmark_output_dir / f"{csv_path.stem}.shard-{shard_config.shard_index:03d}-of-{shard_config.num_shards:03d}.csv"
+        shutil.copy2(csv_path, result_csv_path)
+        print(f"Shard CSV (isolated writes): {result_csv_path}")
     csv_lock = Lock()
 
     print(f"\n{'=' * 80}")
     print(f"🚀 Starting {'sequential' if args.sequential else 'parallel'} ProcTHOR dual-agent benchmark")
     print(f"{'=' * 80}")
     print(f"Total tasks: {len(task_ids)}")
+    print(f"Task shard: {shard_config.shard_index}/{shard_config.num_shards} ({args.shard_strategy})")
     print(f"Workers: {1 if args.sequential else args.workers}")
     print(f"Config: {actual_config_path}")
     if args.agent1:
@@ -922,12 +1020,77 @@ def main() -> int:
         print(f"Switch interval: {args.switch_interval}")
     if args.headless:
         print("Headless: enabled")
+    if args.history_feedback:
+        print("History feedback: enabled")
+    if args.llm_history_feedback:
+        print("LLM history feedback: enabled")
+    if args.image_scale and args.image_scale < 1.0:
+        print(f"Image scale: {args.image_scale}")
+    if args.image_recent_steps and args.image_recent_steps > 0:
+        print(f"Image recent steps: {args.image_recent_steps}")
+    if args.partner_view:
+        print("Partner view: enabled")
     print(f"{'=' * 80}\n")
 
     def execute_task(task_id: str) -> Dict[str, Any]:
+        # 整个函数体用最外层 try/except 兜底：无论内部（包括 load_task_metadata、
+        # mkdir 等在“正常”try 块之外的调用）抛出什么异常，都绝不让它冒泡到
+        # ThreadPoolExecutor / future.result()。否则单个任务的意外异常会导致
+        # 整个 shard 主进程崩溃退出（跳过写 benchmark_summary.json 的收尾逻辑），
+        # 让其余已经跑完/正在跑的任务的结果全部丢失且难以定位原因。
+        try:
+            return _execute_task_inner(task_id)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            tb = traceback.format_exc()
+            print(f"  ❌ {task_id} unhandled exception in execute_task: {exc}\n{tb}")
+            try:
+                (benchmark_output_dir / task_id).mkdir(parents=True, exist_ok=True)
+                write_missing_result_diagnostic(
+                    str(benchmark_output_dir / task_id),
+                    task_id,
+                    None,
+                    "",
+                    "",
+                    error_text=f"Unhandled exception in execute_task: {exc}\n{tb}",
+                )
+            except Exception:
+                pass
+            return {
+                "task_id": task_id,
+                "status": "failed_external",
+                # 未被 _execute_task_inner 自身捕获的异常（例如 load_task_metadata/
+                # mkdir 在 IO 抖动的网络文件系统上出错）比普通 API 波动更值得警惕，
+                # 归类为 external_error 而非 api_error。
+                "failure_type": "external_error",
+                "duration": 0.0,
+                "success": False,
+                "failure_reason": f"Unhandled exception in execute_task: {exc}",
+                "copied_to_completed": False,
+                "task_result": None,
+                "agent_1_steps": 0,
+                "agent_2_steps": 0,
+                "communication_events": 0,
+                "turn_count": 0,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "golden_actions_count": None,
+                "actual_actions_count": None,
+            }
+        finally:
+            with INFLIGHT_TASKS_LOCK:
+                INFLIGHT_TASKS.discard(normalize_task_id(task_id))
+
+    def _execute_task_inner(task_id: str) -> Dict[str, Any]:
         task_start = time.time()
         task_log_parts: List[str] = []
         task_status = "failed_external"
+        # failure_type_detail 记录更细粒度的失败分类，用于区分“API 波动”（瞬时、
+        # 不代表本机环境有问题，不应让整个 shard 非零退出）与“环境/未知异常”
+        # （更可能意味着本机/容器环境本身出了问题，值得让集群感知并重启）。
+        failure_type_detail: Optional[str] = None
         task_success = False
         copied_to_completed = False
         task_metadata = load_task_metadata(task_id)
@@ -954,6 +1117,7 @@ def main() -> int:
                     "duration": time.time() - task_start,
                     "success": False,
                     "failure_reason": "Task already running (dedupe protection)",
+                    "failure_type": "external_error",
                     "copied_to_completed": False,
                     "task_result": None,
                     "agent_1_steps": 0,
@@ -998,19 +1162,27 @@ def main() -> int:
                 cmd.extend(["--switch-interval", str(args.switch_interval)])
             if args.headless:
                 cmd.append("--headless")
+            if args.history_feedback:
+                cmd.append("--history-feedback")
+            if args.llm_history_feedback:
+                cmd.append("--llm-history-feedback")
+            if args.image_scale and args.image_scale < 1.0:
+                cmd.extend(["--image-scale", str(args.image_scale)])
+            if args.image_recent_steps and args.image_recent_steps > 0:
+                cmd.extend(["--image-recent-steps", str(args.image_recent_steps)])
+            if args.partner_view:
+                cmd.append("--partner-view")
+            if args.partner_view_scale is not None:
+                cmd.extend(["--partner-view-scale", str(args.partner_view_scale)])
 
-            exec_start = time.time()
-            result = subprocess.run(
-                cmd,
-                cwd=str(PROJECT_ROOT),
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=None,
+            return_code, stdout_text, exec_dur = run_task_subprocess_streaming(
+                cmd=cmd,
+                cwd=PROJECT_ROOT,
+                task_id=task_id,
+                task_output_dir=benchmark_task_output_dir,
+                timeout_seconds=args.task_timeout_seconds or None,
             )
-            exec_dur = time.time() - exec_start
-            stdout_text = result.stdout or ""
-            stderr_text = result.stderr or ""
+            stderr_text = ""
 
             if stdout_text:
                 task_log_parts.append("=== STDOUT ===\n")
@@ -1022,7 +1194,7 @@ def main() -> int:
                 task_log_parts.append("\n")
             task_log_parts.append("=== Run info ===\n")
             task_log_parts.append(f"Command: {' '.join(cmd)}\n")
-            task_log_parts.append(f"Exit code: {result.returncode}\n")
+            task_log_parts.append(f"Exit code: {return_code}\n")
             task_log_parts.append(f"Duration: {exec_dur:.2f}s\n")
             task_log_parts.append("=" * 80 + "\n\n")
 
@@ -1044,7 +1216,7 @@ def main() -> int:
                     extra = build_csv_extra_fields(
                         task_metadata, actual_actions_info, token_stats, failure_reason_detail
                     )
-                    update_csv_task_record(csv_path, task_id, status="true", extra_fields=extra, lock=csv_lock)
+                    update_csv_task_record(result_csv_path, task_id, status="true", extra_fields=extra, lock=csv_lock)
                 print(f"  ✅ {task_id} success")
             else:
                 failure_reason = determine_failure_reason(task_log, result_json)
@@ -1060,7 +1232,8 @@ def main() -> int:
                 if result_json:
                     if failure_reason in ("api_error", "env_error", "external_error") and csv_status != "false":
                         task_status = "failed_external"
-                        print(f"  ⚠️  {task_id} external failure -> null")
+                        failure_type_detail = failure_reason
+                        print(f"  ⚠️  {task_id} external failure ({failure_reason}) -> null")
                     else:
                         task_status = "failed_model"
                         print(f"  ❌ {task_id} model failure -> {csv_status}")
@@ -1071,21 +1244,22 @@ def main() -> int:
                         )
                     if csv_path:
                         update_csv_task_record(
-                            csv_path, task_id, status=csv_status, extra_fields=extra, lock=csv_lock
+                            result_csv_path, task_id, status=csv_status, extra_fields=extra, lock=csv_lock
                         )
                 else:
                     task_status = "failed_external"
+                    failure_type_detail = "external_error"
                     failure_reason_detail = "No result JSON produced"
                     write_missing_result_diagnostic(
                         str(benchmark_task_output_dir),
                         task_id,
-                        result.returncode,
+                        return_code,
                         stdout_text,
                         stderr_text,
                         error_text=failure_reason_detail,
                     )
                     if csv_path:
-                        update_csv_task_record(csv_path, task_id, status=None, extra_fields=extra, lock=csv_lock)
+                        update_csv_task_record(result_csv_path, task_id, status=None, extra_fields=extra, lock=csv_lock)
                     print(f"  ⚠️  {task_id} no result JSON -> null")
 
         except KeyboardInterrupt:
@@ -1119,12 +1293,17 @@ def main() -> int:
                     )
             else:
                 task_status = "failed_external"
+                # 主线程未捕获的异常（代码 bug、IO 异常等）比 API 错误更值得警惕，
+                # 归入 external_error 而不是 api_error，以便下面的 exit_code 判定仍然能
+                # 感知到这类非典型 API 波动的问题。若 failure_reason 本身已经是
+                # api_error/env_error 则保留原分类。
+                failure_type_detail = failure_reason if failure_reason in ("api_error", "env_error") else "external_error"
                 if not result_json:
                     write_missing_result_diagnostic(
                         str(benchmark_task_output_dir), task_id, None, "", "", error_text=error_msg
                     )
             if csv_path:
-                update_csv_task_record(csv_path, task_id, status=csv_status, extra_fields=extra, lock=csv_lock)
+                update_csv_task_record(result_csv_path, task_id, status=csv_status, extra_fields=extra, lock=csv_lock)
             print(f"  ❌ {task_id} exception: {error_msg}")
         finally:
             with INFLIGHT_TASKS_LOCK:
@@ -1134,6 +1313,7 @@ def main() -> int:
         return {
             "task_id": task_id,
             "status": task_status,
+            "failure_type": failure_type_detail,
             "duration": duration,
             "success": task_success,
             "failure_reason": failure_reason_detail,
@@ -1154,8 +1334,22 @@ def main() -> int:
     successful = 0
     failed_model = 0
     failed_external = 0
+    # failed_external 再细分：failed_api 是纯 API 波动（限流/超时/413 等瞬时问题，
+    # 任务已在 CSV 中标记为 null 供后续重跑，不代表本机/容器环境有问题）；
+    # failed_infra 是环境崩溃（env_error）、结果缺失、未捕获异常等更严重的问题，
+    # 更可能意味着当前机器/容器本身出了故障，值得让 exit_code 非零、触发集群感知重启。
+    failed_api = 0
+    failed_infra = 0
     copied_count = 0
     exit_code = 0
+
+    def _bump_failed_external_counters(res: Dict[str, Any]) -> None:
+        nonlocal failed_external, failed_api, failed_infra
+        failed_external += 1
+        if res.get("failure_type") == "api_error":
+            failed_api += 1
+        else:
+            failed_infra += 1
 
     try:
         if args.sequential:
@@ -1170,7 +1364,7 @@ def main() -> int:
                 elif res["status"] == "failed_model":
                     failed_model += 1
                 else:
-                    failed_external += 1
+                    _bump_failed_external_counters(res)
                 if res.get("copied_to_completed"):
                     copied_count += 1
         else:
@@ -1188,18 +1382,36 @@ def main() -> int:
                     elif res["status"] == "failed_model":
                         failed_model += 1
                     else:
-                        failed_external += 1
+                        _bump_failed_external_counters(res)
                     if res.get("copied_to_completed"):
                         copied_count += 1
                     if HAS_TQDM:
                         iterator.set_postfix(
-                            {"ok": successful, "model": failed_model, "external": failed_external, "copied": copied_count}
+                            {"ok": successful, "model": failed_model, "api": failed_api, "infra": failed_infra, "copied": copied_count}
                         )
     except KeyboardInterrupt:
         print("\n⚠️ User interrupt")
         exit_code = 1
+    except Exception as exc:
+        # 兜底：execute_task 本身已经不会再抛出非 KeyboardInterrupt 异常，但
+        # ThreadPoolExecutor/tqdm 等调度层代码理论上仍可能出问题。宁可在这里
+        # 记录清晰的异常堆栈并仍然写出已收集到的 records 的 summary，
+        # 也不要让主进程直接崩溃、丢失所有已完成任务的结果且无从排查原因。
+        print(f"\n❌ Unexpected error in task scheduling loop: {exc}")
+        traceback.print_exc()
+        exit_code = 1
     else:
-        exit_code = 0 if (failed_model + failed_external) == 0 else 1
+        # `failed_model` 是评测层面的正常负样本（例如模型误判 DONE / 达到最大步数），
+        # 属于预期内的 benchmark 结果，不应视为进程运行错误。
+        # `failed_api`（限流/超时/413 等 API 波动）同样不应让整个 shard 非零退出：
+        # 这类失败通常只是瞬时的、与当前机器/容器环境无关，任务已写回 CSV 为
+        # null，后续重跑（--skip-completed）会自动补跑，没必要因为个别任务撞上
+        # 一次 API 抖动就让 AFO 判定整个 worker task 失败、杀掉同一 worker 上其它
+        # 正常运行的任务。
+        # 只有 `failed_infra`（环境崩溃 env_error、结果缺失、未捕获异常等）才代表
+        # 本次 shard 运行本身/所在机器出了问题，才需要让进程以非零码退出（供集群
+        # 调度层据此重试/告警/重启容器）。
+        exit_code = 0 if failed_infra == 0 else 1
     finally:
         if temp_config and os.path.exists(temp_config):
             try:
@@ -1226,6 +1438,18 @@ def main() -> int:
             f.write(f"Max steps: {args.max_steps}\n")
         if args.switch_interval:
             f.write(f"Switch interval: {args.switch_interval}\n")
+        if args.history_feedback:
+            f.write("History feedback: enabled\n")
+        if args.llm_history_feedback:
+            f.write("LLM history feedback: enabled\n")
+        if args.image_scale and args.image_scale < 1.0:
+            f.write(f"Image scale: {args.image_scale}\n")
+        if args.image_recent_steps and args.image_recent_steps > 0:
+            f.write(f"Image recent steps: {args.image_recent_steps}\n")
+        if args.partner_view:
+            f.write("Partner view: enabled\n")
+            if args.partner_view_scale is not None:
+                f.write(f"Partner view scale: {args.partner_view_scale}\n")
         f.write("\n" + "=" * 80 + "\n")
         f.write("Summary\n")
         f.write("=" * 80 + "\n")
@@ -1233,7 +1457,10 @@ def main() -> int:
         if task_ids:
             f.write(f"Success: {successful} ({successful / len(task_ids) * 100:.1f}%)\n")
             f.write(f"Model failure: {failed_model} ({failed_model / len(task_ids) * 100:.1f}%)\n")
-            f.write(f"External failure: {failed_external} ({failed_external / len(task_ids) * 100:.1f}%)\n")
+            f.write(
+                f"External failure: {failed_external} ({failed_external / len(task_ids) * 100:.1f}%) "
+                f"[api: {failed_api}, infra: {failed_infra}]\n"
+            )
         f.write(f"Copied to outputs_completed: {copied_count}\n")
         f.write(f"Total time: {total_dur:.2f}s ({total_dur / 60:.2f} min)\n")
         f.write(f"Avg time: {avg_dur:.2f}s\n")
@@ -1241,6 +1468,7 @@ def main() -> int:
     summary_json = {
         "timestamp": timestamp,
         "csv": str(csv_path) if csv_path else None,
+        "result_csv": str(result_csv_path) if result_csv_path else None,
         "config": str(config_path),
         "actual_config": str(actual_config_path),
         "output_dir": str(benchmark_output_dir),
@@ -1248,12 +1476,25 @@ def main() -> int:
         "workers": 1 if args.sequential else args.workers,
         "collaboration_mode": args.collaboration_mode,
         "max_steps": args.max_steps,
+        "task_timeout_seconds": args.task_timeout_seconds,
         "switch_interval": args.switch_interval,
         "headless": args.headless,
+        "history_feedback": args.history_feedback,
+        "llm_history_feedback": args.llm_history_feedback,
+        "image_scale": args.image_scale,
+        "image_recent_steps": args.image_recent_steps,
+        "partner_view": args.partner_view,
+        "partner_view_scale": args.partner_view_scale,
+        "num_shards": shard_config.num_shards,
+        "shard_index": shard_config.shard_index,
+        "shard_strategy": args.shard_strategy,
+        "unsharded_task_count": unsharded_task_count,
         "total_tasks": len(task_ids),
         "successful": successful,
         "failed_model": failed_model,
         "failed_external": failed_external,
+        "failed_api": failed_api,
+        "failed_infra": failed_infra,
         "copied_to_completed": copied_count,
         "duration_seconds": total_dur,
         "avg_duration_seconds": avg_dur,
@@ -1268,13 +1509,13 @@ def main() -> int:
     print(f"Total tasks: {len(task_ids)}")
     print(f"Success: {successful}")
     print(f"Model failure: {failed_model}")
-    print(f"External failure: {failed_external}")
+    print(f"External failure: {failed_external} (api: {failed_api}, infra: {failed_infra})")
     print(f"Copied to outputs_completed: {copied_count}")
     print(f"Output dir: {benchmark_output_dir}")
     print(f"Summary log: {summary_log_path}")
 
-    if csv_path:
-        stats = count_csv_status(csv_path)
+    if result_csv_path:
+        stats = count_csv_status(result_csv_path)
         total = stats["total"]
         if total:
             print(f"\nCSV status (total {total}):")

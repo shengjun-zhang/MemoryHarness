@@ -50,6 +50,8 @@ You are working with a partner agent (your peer) to complete the task together. 
 **Messages from Partner (the ONLY way you learn about your partner):**
 {shared_context}
 
+{memory_index_block}
+
 **Available Actions:**
 
 1. **Navigation Actions** — support step granularity (Large / Medium / Small):
@@ -88,6 +90,9 @@ You are working with a partner agent (your peer) to complete the task together. 
    - DONE: Use ONLY when you have visually verified that ALL task objectives are complete.
    - FAIL: Use when the task is impossible, unsafe, or you cannot proceed.
 
+7. **Memory Lookup** (no environment effect, no step-budget cost):
+   - ReadMemory(<file_name>): Look up an entry from the Memory Library (see above). Use this whenever you are unsure how to recover from an error, before your first action, or before outputting DONE. Example: ReadMemory(feedback_blocking_agents.md).
+
 **Interactable Objects in ProcTHOR Environment:**
 - Openable: Blinds, Book, Box, Cabinet, Drawer, Fridge, Kettle, Laptop, LaundryHamper, Microwave, Safe, ShowerCurtain, ShowerDoor, Toilet
 - Toggleable: Candle, CellPhone, CoffeeMachine, DeskLamp, Desktop, Faucet, FloorLamp, Laptop, LightSwitch, Microwave, ShowerHead, StoveKnob, Television, Toaster
@@ -121,6 +126,7 @@ You are working with a partner agent (your peer) to complete the task together. 
    - If your partner says "I did X", check if X is actually done in your view before claiming DONE.
    - If your last action returned an error, the task is NOT yet complete.
    - If you are unsure, keep working instead of saying DONE.
+   - Before your first DONE attempt, consider `ReadMemory(feedback_done_verification.md)` if available — DONE is verified by a real evaluator, not a self-report.
 
 **Collaboration Strategy:**
 1. **Initial Orientation**: In the first few steps, look around (rotate, LookUp/LookDown) to survey your environment, then tell your partner what you see.
@@ -139,7 +145,7 @@ Verification: If I am considering DONE, have I visually confirmed EVERY success 
 Next Action: Concrete single action I will output below.
 </THINK>
 <ACTION>
-ActionName or ActionName(ObjectType) or FillObjectWithLiquid(ObjectType, LiquidType) or DropHandObject or ThrowObject or DONE or FAIL
+ActionName or ActionName(ObjectType) or FillObjectWithLiquid(ObjectType, LiquidType) or DropHandObject or ThrowObject or ReadMemory(<file_name>) or DONE or FAIL
 </ACTION>
 <COMMUNICATE>
 Optional but highly recommended when you discover something, change plan, or an action fails.
@@ -220,6 +226,7 @@ My PickupObject(Pen) failed — I was too far. Moving closer, will retry after t
 - Use FillObjectWithLiquid(ObjectType, LiquidType) if you need a non-default liquid (coffee / wine).
 - COMMUNICATE often — it is your partner's only channel of info from you.
 - NEVER claim DONE based solely on your partner's message — VERIFY with your own eyes.
+- Use the Memory Library: `ReadMemory(<file_name>)` costs no step budget. Read the matching entry when you hit a repeated error or aren't sure how to proceed.
 """
 
 
@@ -245,16 +252,19 @@ DUAL_AGENT_PROCTHOR_PROMPT_WITH_SUMMARY = DUAL_AGENT_PROCTHOR_PROMPT_NO_SUMMARY.
 def get_dual_procthor_prompt(enable_summary: bool = False) -> str:
     """Return the ProcTHOR dual-agent system prompt template.
 
-    The template expects two format placeholders: ``{task_prompt}`` and
-    ``{shared_context}`` (communication history). No ``{partner_trajectory}`` is
-    used here because ``mllm_base_agent/dual_agent/procthor/main.py`` only passes these two fields.
+    The template expects three format placeholders: ``{task_prompt}``,
+    ``{shared_context}`` (communication history), and ``{memory_index_block}``
+    (the skill-memory library index, see :mod:`mllm_base_agent.tools.memory`;
+    pass ``""`` if no memory library is configured). No ``{partner_trajectory}``
+    is used here because ``mllm_base_agent/dual_agent/procthor/main.py`` only
+    passes these fields.
 
     Args:
         enable_summary: if True, also instruct the model to emit a <SUMMARY>
             block (used when context_management.enable_long_term_summary=True).
 
     Returns:
-        System prompt string ready to ``.format(task_prompt=..., shared_context=...)``.
+        System prompt string ready to ``.format(task_prompt=..., shared_context=..., memory_index_block=...)``.
     """
     if enable_summary:
         return DUAL_AGENT_PROCTHOR_PROMPT_WITH_SUMMARY

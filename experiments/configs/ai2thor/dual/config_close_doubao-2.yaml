@@ -10,7 +10,52 @@ env:
   render_instance_segmentation: false
   text_state_mode: first_person
   visibility_distance: 1.5
-  platform: null
+  platform: CloudRendering
+  # gpu_device: 0  # Disabled: real NVIDIA Vulkan ICD on this host makes the ai2thor Unity
+  # process hang in a busy-wait loop during Vulkan init (root cause not yet fixed). Falling
+  # back to the lavapipe (mesa-vulkan) software Vulkan renderer, which does not support/need
+  # gpu_device-based CUDA<->Vulkan UUID mapping. Re-enable once the real-GPU Vulkan path is fixed.
+  # force_vulkan_device_index (NOT gpu_device) is required to actually select the lavapipe CPU
+  # Vulkan device: Unity 2020 does not auto-select a CPU physical device
+  # (requestedDeviceIndex=-1) and instead busy-waits during Vulkan init trying to find a GPU
+  # device, which manifests as the Unity subprocess starting (survives the 1s post-launch
+  # liveness check in ai2thor's _start_unity_thread) but never opening its FIFO handshake pipe --
+  # i.e. Python blocks forever in ai2thor.fifo_server.FifoServer._recv_message()'s
+  # open(self.server_pipe_path, "rb") (NOT subject to server_start_timeout, since that timeout
+  # only bounds the read-after-open phase), which is exactly the "stuck forever right after
+  # AI2ThorEnvWrapper.__init__ starting -> Launching AI2-THOR Unity subprocess, heartbeat
+  # forever, no further log lines" symptom. This was already fixed in the single-agent
+  # ai2thor config and both procthor configs; missing here was the actual root cause of this
+  # dual-agent hang (previous fixes for the fcntl/AI2THOR_HOME cross-node lock issue were a
+  # real but separate bug).
+  force_vulkan_device_index: 0
+  server_start_timeout: 300
+  # ---------------------------------------------------------------------------
+  # AI2-THOR network + runtime dependency configuration (see mllm_base_agent/
+  # environments/ai2thor/wrapper.py::_apply_ai2thor_env_overrides for details)
+  # ---------------------------------------------------------------------------
+  # Fixes "ValueError: Invalid commit_id: ... no build exists for arch=Linux
+  # platforms=CloudRendering" by routing the AWS S3 build-lookup/download through a proxy.
+  http_proxy: http://10.70.18.228:8412
+  https_proxy: http://10.70.18.228:8412
+  # Fixes "Platform CloudRendering failed validation ... Vulkan API driver missing.
+  # CloudRendering requires libvulkan1" without root/apt-get, by pointing LD_LIBRARY_PATH
+  # at a directory that already contains libvulkan.so.1.
+  ai2thor_ld_library_path: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/conda-envs/spatialworld-ai2thor/lib
+  # Optional Mesa lavapipe software-rendering fallback if no vendor GPU Vulkan ICD exists:
+  # ai2thor_vk_icd_filenames: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/conda-envs/mesa-vulkan/share/vulkan/icd.d/lvp_icd.x86_64.json
+  # NOTE: ai2thor_home is intentionally NOT set here. wrapper.py reads
+  # env.ai2thor_home with priority over the AI2THOR_HOME environment variable
+  # (env_config.get("ai2thor_home", os.environ.get("AI2THOR_HOME"))), so hardcoding
+  # a shared DolphinFS path here would silently override the *local* per-node/
+  # container cache path (AI2THOR_HOME) that hope/launch_*_benchmark.sh exports via
+  # seed_local_ai2thor_cache(). That reintroduces the cross-node fcntl.lockf()
+  # deadlock in ai2thor/util/lock.py (Controller() calling self._build.lock_sh())
+  # -- the exact "stuck forever right after AI2ThorEnvWrapper.__init__ starting,
+  # heartbeat forever, no further log lines" symptom. Let it fall back to the
+  # AI2THOR_HOME env var (local disk) instead; if you need to override it for a
+  # one-off local run, pass it via the AI2THOR_HOME/AI2THOR_LOCAL_HOME env vars,
+  # not here.
 
 max_steps: 30
 
@@ -26,11 +71,16 @@ dual_agent:
 
 model:
   vlm:
-    provider: chat
-    model_name: bytedance-seed/seed-2.0-lite
+    provider: openai
+    model_name: Doubao-Seed-2.0-lite
+    temperature: 1.0
+    top_p: 0.9
     max_tokens: 4096
-    base_url: null
-    api_key: null
+    base_url: https://aigc.sankuai.com/v1/openai/native
+    api_key: "2011286628471992379"
+    model_kwargs:
+      thinking:
+        type: disabled
 
 logging:
   stdout_verbose: true

@@ -21,6 +21,18 @@ from actions.max_steps import resolve_max_steps_from_task
 from config import load_config, print_config
 from core.llm.provider import get_vlm
 from core.agent.graph import create_agent_graph
+from mllm_base_agent.tools.memory import MemoryLibrary
+
+
+def log_ts(message: str) -> None:
+    """Print a message prefixed with a wall-clock timestamp.
+
+    Used to mark the start/end of long-running stages (config loading, LLM
+    init, env creation, per-task execution, ...) so cluster job logs make it
+    easy to tell which stage is currently running and how long it has been
+    stuck there, instead of only seeing a wall of un-timestamped prints.
+    """
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
 
 def load_init_actions_from_folder(task_folder_path: str) -> tuple:
@@ -391,7 +403,62 @@ Example usage:
         help="Run AI2-THOR with CloudRendering (no display server)",
     )
 
+    parser.add_argument(
+        "--image-scale",
+        type=float,
+        default=None,
+        help=(
+            "Downscale factor for HISTORY images sent to the VLM (0 < scale <= 1.0). "
+            "e.g. --image-scale 0.5 resizes 800x600 -> 400x300 before base64 encoding, "
+            "shrinking the request body and avoiding HTTP 413 on long multi-image episodes. "
+            "The current-step observation is always full-resolution. Default: no scaling "
+            "(uses config.image.scale if set, otherwise 1.0)."
+        ),
+    )
+    parser.add_argument(
+        "--image-recent-steps",
+        type=int,
+        default=None,
+        help=(
+            "Number of most-recent history steps whose images are kept at original "
+            "resolution; older history images are downscaled to --image-scale. Only "
+            "meaningful when --image-scale < 1.0. Default: uses config.image.recent_steps "
+            "if set, otherwise 0."
+        ),
+    )
+
+    parser.add_argument(
+        "--decision-mode",
+        type=str,
+        default=None,
+        choices=["standard", "lookahead"],
+        help=(
+            "Per-step decision strategy. 'standard' (default): the model picks one action "
+            "directly from the current observation, which is then executed. 'lookahead': "
+            "before asking the model to decide, every candidate discrete action (navigation "
+            "moves/turns plus interactions inferred from currently-visible objects) is "
+            "tentatively executed to obtain its resulting image, then rolled back; the model "
+            "then chooses which action to actually commit after seeing all candidate outcomes. "
+            "Default: uses config.decision.mode if set, otherwise 'standard' (no behavior change)."
+        ),
+    )
+    parser.add_argument(
+        "--history-window-size",
+        type=int,
+        default=None,
+        help=(
+            "Number of most-recent steps kept in the short-term multimodal history sent to "
+            "the VLM (overrides config.context_management.short_term_history_window_size). "
+            "Smaller values shrink the per-request payload (fewer history images), which "
+            "helps avoid HTTP 413 Request Entity Too Large on long episodes, at the cost of "
+            "less context for the model. Default: uses config.context_management."
+            "short_term_history_window_size if set, otherwise the built-in cap (29)."
+        ),
+    )
+
     args = parser.parse_args()
+
+    log_ts("🏁 [STAGE] run_task.py main() started")
 
     # Load configuration
     print(f"\n{'=' * 60}")
@@ -400,6 +467,7 @@ Example usage:
     print(f"Config file: {args.config}")
 
     config = load_config(args.config)
+    log_ts("✓ [STAGE] Configuration loaded")
 
     # Read environment type from config file, default to ai2thor if not found
     env_type = args.env  # Command line argument takes priority
@@ -425,6 +493,39 @@ Example usage:
     if args.headless:
         config.update("env.platform", "CloudRendering")
         print("✓ Headless mode enabled: env.platform=CloudRendering")
+
+    if args.image_scale is not None:
+        _image_scale = float(args.image_scale)
+        if _image_scale <= 0.0 or _image_scale > 1.0:
+            print(f"⚠️  --image-scale {_image_scale} out of range (0, 1.0]; ignoring (no scaling)")
+            _image_scale = 1.0
+        config.update("image.scale", _image_scale)
+        if _image_scale < 1.0:
+            print(
+                f"✓ Image downscale: enabled (scale={_image_scale}, 800x600 -> "
+                f"{int(round(800 * _image_scale))}x{int(round(600 * _image_scale))})"
+            )
+
+    if args.image_recent_steps is not None:
+        _image_recent_steps = int(args.image_recent_steps)
+        if _image_recent_steps < 0:
+            print(f"⚠️  --image-recent-steps {_image_recent_steps} < 0; treating as 0")
+            _image_recent_steps = 0
+        config.update("image.recent_steps", _image_recent_steps)
+        print(f"✓ Image recent-steps: keeping the {_image_recent_steps} most-recent history images at full resolution")
+
+    if args.decision_mode is not None:
+        config.update("decision.mode", args.decision_mode)
+        print(f"✓ Decision mode overridden: {args.decision_mode}")
+    decision_mode = config.get("decision.mode", "standard")
+
+    if args.history_window_size is not None:
+        _history_window_size = int(args.history_window_size)
+        if _history_window_size < 0:
+            print(f"⚠️  --history-window-size {_history_window_size} < 0; treating as 0")
+            _history_window_size = 0
+        config.update("context_management.short_term_history_window_size", _history_window_size)
+        print(f"✓ Short-term history window size overridden: {_history_window_size}")
 
     # If only printing config, print and exit
     if args.print_config:
@@ -485,12 +586,14 @@ Example usage:
     print(f"{'=' * 60}")
     print(f"Environment: {env_type}")
     print(f"VLM Model: {config.get('model.vlm.model_name')}")
+    print(f"Decision mode: {decision_mode}")
     print(f"Task count: {len(task_names)}")
     print(f"Output directory: {run_output_dir}")
     print(f"{'=' * 60}\n")
 
     # Initialize LLM
     vlm_config = config.get_section("model").get("vlm", {})
+    log_ts(f"🚀 [STAGE] Initializing VLM client (model={vlm_config.get('model_name', 'gpt-4o')})...")
     if vlm_config.get("provider", "openai").lower() == "openai" and not (
         vlm_config.get("api_key") or os.getenv("OPENAI_API_KEY")
     ):
@@ -507,16 +610,20 @@ Example usage:
         top_p=vlm_config.get("top_p"),
         base_url=vlm_config.get("base_url"),
         api_key=vlm_config.get("api_key"),
+        model_kwargs=vlm_config.get("model_kwargs"),
     )
+    log_ts("✓ [STAGE] VLM client initialized")
 
     # Create Agent graph
     agent_graph = create_agent_graph()
+    log_ts("✓ [STAGE] Agent graph created")
 
     # Statistics results
     all_results = []
 
     # Loop through each task
     for task_idx, task_name in enumerate(task_names, 1):
+        log_ts(f"🏁 [STAGE] Task {task_idx}/{len(task_names)} '{task_name}' starting")
         print(f"\n{'=' * 60}")
         print(f"📋 Task {task_idx}/{len(task_names)}: {task_name}")
         print(f"{'=' * 60}")
@@ -599,6 +706,7 @@ Example usage:
             print(f"Executor: {executor_type}")
 
         # Dynamically create environment with task-specific scene
+        log_ts(f"🚀 [STAGE] Creating '{env_type}' environment (scene={task_scene})... (this launches the simulator and can take a while)")
         try:
             env = create_env(
                 env_type,
@@ -607,10 +715,12 @@ Example usage:
                 scene=task_scene,
                 executor_type=executor_type,
             )
+            log_ts("✓ [STAGE] Environment created")
         except NotImplementedError as e:
             print(f"❌ {e}")
             continue
         except Exception as e:
+            log_ts(f"✗ [STAGE] Failed to create environment: {e}")
             print(f"❌ Failed to create environment: {e}")
             import traceback
 
@@ -694,9 +804,19 @@ Example usage:
                 "executor_type": executor_type,
                 "input_modality": input_modality,
                 "goal_image_path": goal_image_path,
+                "decision_mode": decision_mode,
+                # Skill-memory library (mirrors the dual-agent MEMORY.md /
+                # feedback_*.md pattern, see mllm_base_agent/tools/memory.py):
+                # a reviewed index of past-run lessons plus on-demand leaf
+                # notes, read via the ReadMemory(<file_name>) pseudo-action
+                # intercepted in mllm_base_agent/agent/runner.py. Degrades
+                # gracefully to "no memory available" for env types that do
+                # not (yet) have a single_agent/<env>/core/memory/ library.
+                "memory_library": MemoryLibrary.for_env(env_type, agent_mode="single"),
             }
 
             # Run Agent graph
+            log_ts(f"🎬 [STAGE] Task '{task_name}' agent graph execution starting (max_steps={task_config.get('max_steps', 30)})...")
             print("🎬 Starting task execution...\n")
             
             # Use stream() to capture intermediate states, so we can save files even when GraphRecursionError occurs
@@ -716,9 +836,17 @@ Example usage:
                         if isinstance(state_update, dict):
                             # Merge the state update into last_state
                             last_state = {**last_state, **state_update}
+                        # Per-node heartbeat log: prints as soon as each graph node
+                        # (think/act/etc.) finishes, so a stuck step (e.g. a slow
+                        # LLM call or a hung env.step) is visible immediately in the
+                        # cluster log instead of only showing up once the whole task ends.
+                        cur_step = last_state.get("step_count", "?")
+                        max_step = last_state.get("max_steps", "?")
+                        log_ts(f"  ↳ [STEP] node='{node_name}' finished (step {cur_step}/{max_step})")
                 
                 # If we get here, execution completed normally
                 final_state = last_state
+                log_ts(f"✓ [STAGE] Task '{task_name}' agent graph execution finished normally")
                 
             except GraphRecursionError as e:
                 # Recursion limit reached - save files with last state
@@ -796,6 +924,7 @@ Example usage:
                 )
 
         except KeyboardInterrupt:
+            log_ts(f"✗ [STAGE] Task '{task_name}' interrupted by user")
             print(
                 f"\n\n⚠️  User interrupted execution, completed {task_idx - 1}/{len(task_names)} tasks"
             )
@@ -803,6 +932,7 @@ Example usage:
             break
 
         except Exception as e:
+            log_ts(f"✗ [STAGE] Task '{task_name}' failed with exception: {e}")
             print(f"\n\n❌ Error occurred while executing task '{task_name}': {e}")
             import traceback
 
@@ -818,9 +948,12 @@ Example usage:
             )
 
         finally:
+            log_ts(f"🚀 [STAGE] Closing environment for task '{task_name}'...")
             env.close()
+            log_ts(f"✓ [STAGE] Task {task_idx}/{len(task_names)} '{task_name}' done")
 
     # Print summary results for all tasks
+    log_ts("🏁 [STAGE] All tasks finished, printing summary")
     print_summary_results(all_results, run_output_dir)
 
 

@@ -445,7 +445,9 @@ def main():
     print(f"Summary log: {summary_log_path}")
     print(f"CSV status: true={csv_stats['true']} false={csv_stats['false']} null={csv_stats['null']}")
     print(f"{'=' * 80}\n")
-    sys.exit(0 if (failed_model + failed_external) == 0 else 1)
+    # 任务失败（模型未达成目标）是 benchmark 的正常结果，不应导致非零退出；
+    # 只有 failed_external（环境崩溃/API 错误等真正的异常）才需要非零退出码。
+    sys.exit(0 if failed_external == 0 else 1)
 
 
 if __name__ == "__main__":

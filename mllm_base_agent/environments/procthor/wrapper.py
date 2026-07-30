@@ -40,6 +40,19 @@ try:
 except Exception:
     CloudRendering = None
 
+
+class _ControllerWithForcedVulkanDevice(Controller):
+    """Select a Vulkan device directly without requiring NVIDIA/CUDA mapping."""
+
+    def __init__(self, *args: Any, force_vulkan_device_index: int, **kwargs: Any):
+        self.force_vulkan_device_index = int(force_vulkan_device_index)
+        super().__init__(*args, **kwargs)
+
+    def unity_command(self, width: int, height: int, headless: bool) -> List[str]:
+        command = super().unity_command(width, height, headless)
+        command.extend(["-force-device-index", str(self.force_vulkan_device_index)])
+        return command
+
 #          ，     core   
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -139,6 +152,9 @@ class ProcTHOREnvWrapper(BaseEnv):
         # AI2-THOR backend timeout settings (seconds)
         self.controller_timeout = float(env_config.get("server_timeout", env_config.get("timeout", 100.0)))
         self.controller_start_timeout = float(env_config.get("server_start_timeout", 300.0))
+        # Direct Vulkan index for CPU-only Mesa lavapipe. AI2-THOR's gpu_device
+        # option is NVIDIA-only because it invokes nvidia-smi for UUID mapping.
+        self.force_vulkan_device_index = env_config.get("force_vulkan_device_index")
         # xvfb/physical X display (e.g. ":99"), allow explicit config first, then env DISPLAY
         self.x_display = self._normalize_x_display(
             env_config.get("x_display", os.environ.get("DISPLAY"))
@@ -169,7 +185,49 @@ class ProcTHOREnvWrapper(BaseEnv):
             elif CloudRendering is not None:
                 self.controller_platform = CloudRendering
                 print("  • Headless mode fallback to CloudRendering (no DISPLAY detected)")
-        
+
+        # AI2-THOR Unity build       ：           s3-us-west-2.amazonaws.com
+        #             （no build exists for arch=... platforms=...）      ValueError
+        #       ： local_executable_path        build              ；
+        #      commit_id                    build
+        self.local_executable_path = env_config.get(
+            "local_executable_path", os.environ.get("AI2THOR_LOCAL_EXECUTABLE_PATH")
+        )
+        self.controller_commit_id = env_config.get(
+            "commit_id", os.environ.get("AI2THOR_COMMIT_ID")
+        )
+        # ------------------------------------------------------------------
+        # 绝对路径环境配置：把 AI2-THOR/依赖库/网络代理 全部固定到持久化的
+        # 绝对路径存储下，而不是依赖 $HOME（$HOME 可能随机器/容器重建而失效，
+        # 导致 uv venv 的 python 解释器软链、ai2thor 的 build 缓存全部失效）。
+        # 这样其他能访问同一绝对路径存储（如共享的 dolphinfs 挂载）的机器，
+        # 也能直接复用已下载好的 Unity build 缓存、Vulkan 库等，无需重新联网下载。
+        #   - env.ai2thor_home / AI2THOR_HOME:
+        #       重定向 ai2thor 的 base_dir（原本硬编码为 "~/.ai2thor"，ai2thor 内部
+        #       用 os.path.expanduser("~") 求值）。设置后会把进程的 HOME 环境变量
+        #       临时指向该绝对路径，使 ~/.ai2thor（Unity build 缓存）、~/.prior
+        #       （ProcTHOR 数据集缓存）等都落在持久化绝对路径下。
+        #   - env.ai2thor_ld_library_path / AI2THOR_LD_LIBRARY_PATH:
+        #       追加到 LD_LIBRARY_PATH，用于让 ai2thor.platform.CloudRendering.validate()
+        #       内部调用的 ctypes.util.find_library("vulkan") 能找到 libvulkan.so.1
+        #       （即 "CloudRendering requires libvulkan1" 报错的解决方案），从而不需要
+        #       root 权限执行 apt-get install libvulkan1。
+        #   - env.ai2thor_vk_icd_filenames / VK_ICD_FILENAMES:
+        #       指定 Vulkan ICD（如 Mesa lavapipe 的软件渲染驱动）配置文件路径，
+        #       在没有 GPU 厂商 Vulkan ICD（如 nvidia_icd.json）时的兜底方案。
+        #   - env.http_proxy/https_proxy 或标准 HTTP_PROXY/HTTPS_PROXY 环境变量:
+        #       用于访问 s3-us-west-2.amazonaws.com 下载 Unity build。
+        self.ai2thor_home = env_config.get("ai2thor_home", os.environ.get("AI2THOR_HOME"))
+        self.ai2thor_extra_ld_library_path = env_config.get(
+            "ai2thor_ld_library_path", os.environ.get("AI2THOR_LD_LIBRARY_PATH")
+        )
+        self.ai2thor_vk_icd_filenames = env_config.get(
+            "ai2thor_vk_icd_filenames", os.environ.get("AI2THOR_VK_ICD_FILENAMES")
+        )
+        self.ai2thor_http_proxy = env_config.get("http_proxy", os.environ.get("HTTP_PROXY", os.environ.get("http_proxy")))
+        self.ai2thor_https_proxy = env_config.get("https_proxy", os.environ.get("HTTPS_PROXY", os.environ.get("https_proxy")))
+        self._apply_ai2thor_env_overrides()
+
         #     （     ，  AI2-THOR   ：  /  /    ）
         actions_config = self.config.get("actions", {})
         self.move_small_magnitude = actions_config.get("move_small_magnitude", 0.25)
@@ -271,6 +329,81 @@ class ProcTHOREnvWrapper(BaseEnv):
             self.success_predicate = self._build_success_predicate_from_config()
         
         print("✓ ProcTHOR environment initialized")
+
+    def _apply_ai2thor_env_overrides(self) -> None:
+        """把 ai2thor_home / LD_LIBRARY_PATH / VK_ICD_FILENAMES / 代理 注入到 os.environ。
+
+        这些环境变量都是在 ai2thor 运行时（find_build/download/Controller 启动子进程）才被
+        读取的（os.path.expanduser、ctypes.util.find_library、requests 库），因此只需要在
+        构造 Controller 之前设置好即可，不要求在 import ai2thor 之前完成。
+
+        目的：把所有和 AI2-THOR/ProcTHOR 运行环境相关的状态（Unity build 缓存、Vulkan 库、
+        出网代理）都固定在持久化的绝对路径存储下，而不是依赖易变的 $HOME，这样其他能挂载到
+        同一绝对路径存储的机器也可以直接复用，无需重新联网下载或重新排查驱动缺失问题。
+        """
+        if self.ai2thor_home:
+            ai2thor_home = str(Path(self.ai2thor_home).expanduser())
+            # 安全兜底：如果这里解析出来的路径落在已知的共享/网络文件系统挂载点上（而不是
+            # 本地磁盘），打印醒目警告。ai2thor 用 fcntl.lockf()（ai2thor/util/lock.py）保护
+            # 它的 Unity build 缓存目录，这类文件锁在网络文件系统上跨节点/跨容器并不可靠：
+            # 一旦某个持锁进程被信号强杀（如任务超时被 kill -9），锁可能从 NFS/FUSE 客户端
+            # 角度"卡死"，导致集群里所有后续调用 Controller() 的任务永久阻塞在
+            # self._build.lock_sh()（不可中断、无超时）——表现为日志停在
+            # "AI2ThorEnvWrapper.__init__ starting" 之后，只有心跳没有任何新日志。常见原因：
+            # YAML 配置里的 env.ai2thor_home 优先级高于 AI2THOR_HOME 环境变量，即使 launch
+            # 脚本已经改成导出本地路径，也会被 YAML 里残留的共享路径悄悄覆盖回去。
+            _shared_fs_markers = ("/mnt/dolphinfs/", "/mnt/hdfs/", "/mnt/nfs/")
+            if any(marker in ai2thor_home for marker in _shared_fs_markers):
+                print(
+                    f"  ⚠️  警告：ai2thor_home ({ai2thor_home}) 看起来是共享/网络文件系统路径而非本地磁盘。"
+                    "ai2thor 基于 fcntl.lockf() 的 build 缓存锁在这类文件系统上无法保证跨节点/跨容器可靠，"
+                    "可能导致整个集群死锁（Controller() 卡在 self._build.lock_sh() 里永不返回）。"
+                    "请检查 YAML 配置里是否残留了 env.ai2thor_home 覆盖了启动脚本导出的 AI2THOR_HOME "
+                    "环境变量，建议改为本地磁盘路径（如 /tmp/...）。",
+                    flush=True,
+                )
+            os.makedirs(ai2thor_home, exist_ok=True)
+            os.environ["HOME"] = ai2thor_home
+            print(f"  • AI2-THOR cache HOME redirected to: {ai2thor_home} (base_dir -> {ai2thor_home}/.ai2thor)")
+        if self.ai2thor_extra_ld_library_path:
+            existing = os.environ.get("LD_LIBRARY_PATH", "")
+            paths = [p for p in self.ai2thor_extra_ld_library_path.split(os.pathsep) if p]
+            merged = os.pathsep.join(paths + ([existing] if existing else []))
+            os.environ["LD_LIBRARY_PATH"] = merged
+            print(f"  • LD_LIBRARY_PATH extended with: {self.ai2thor_extra_ld_library_path} (for libvulkan.so lookup)")
+        if self.ai2thor_vk_icd_filenames:
+            os.environ["VK_ICD_FILENAMES"] = self.ai2thor_vk_icd_filenames
+            print(f"  • VK_ICD_FILENAMES set to: {self.ai2thor_vk_icd_filenames}")
+        if self.ai2thor_http_proxy:
+            os.environ["http_proxy"] = self.ai2thor_http_proxy
+            os.environ["HTTP_PROXY"] = self.ai2thor_http_proxy
+        if self.ai2thor_https_proxy:
+            os.environ["https_proxy"] = self.ai2thor_https_proxy
+            os.environ["HTTPS_PROXY"] = self.ai2thor_https_proxy
+        if self.ai2thor_http_proxy or self.ai2thor_https_proxy:
+            print(f"  • Proxy configured for build downloads: http={self.ai2thor_http_proxy}, https={self.ai2thor_https_proxy}")
+            # 注意：http_proxy/https_proxy 是进程级环境变量，一旦在这里设置，同一进程内后续
+            # 无关的 HTTP 客户端调用（例如 VLM agent 通过 requests/httpx/OpenAI SDK 访问美团内部
+            # AIGC 网关 aigc.sankuai.com）也会读取到并被错误地路由到这个代理。该网关是内网服务，
+            # 可直连，并不在这个出网代理（仅用于访问 s3-us-west-2.amazonaws.com 下载 Unity build）
+            # 的覆盖范围内。如果不设置 no_proxy 排除，一旦代理不可用或不允许内网流量，VLM API 调用
+            # 就会被错误代理导致挂起/失败。
+            existing_no_proxy = os.environ.get("no_proxy", os.environ.get("NO_PROXY", ""))
+            internal_domains = [
+                "sankuai.com",
+                "meituan.com",
+                ".mt",
+                "localhost",
+                "127.0.0.1",
+            ]
+            merged_no_proxy = ",".join(
+                dict.fromkeys(
+                    [d for d in existing_no_proxy.split(",") if d] + internal_domains
+                )
+            )
+            os.environ["no_proxy"] = merged_no_proxy
+            os.environ["NO_PROXY"] = merged_no_proxy
+            print(f"  • no_proxy set to exclude internal Meituan domains from the proxy: {merged_no_proxy}")
 
     @staticmethod
     def _normalize_x_display(raw_display: Optional[Any]) -> Optional[str]:
@@ -502,21 +635,65 @@ class ProcTHOREnvWrapper(BaseEnv):
                 "CloudRendering" if (CloudRendering is not None and self.controller_platform is CloudRendering) else str(self.controller_platform)
             )
             print(f"  • Using controller platform: {platform_name}")
+        # local_executable_path：      Unity build         ，       find_build()
+        #      requests.head(...s3-us-west-2.amazonaws.com...)          
+        if self.local_executable_path:
+            controller_kwargs["local_executable_path"] = self.local_executable_path
+            print(f"  • Using local_executable_path: {self.local_executable_path} (skips remote build lookup)")
+        elif self.controller_commit_id:
+            controller_kwargs["commit_id"] = self.controller_commit_id
+            print(f"  • Using explicit commit_id: {self.controller_commit_id}")
         # ProcTHOR + AI2-THOR v5         ：
         #     Controller(scene=<procthor_house>, agentCount=2)   ，AI2-THOR      
         # Reset(Procedural) → Initialize(agentCount=2) → CreateHouse(house)    CreateHouse
         #    agent      1，    agentId=1             （fifo   ） 
         #       ：      Controller（   scene），    CreateHouse + Initialize(agentCount=N) 
-        deferred_procthor_load = bool(self.agent_count > 1)
+        #
+        # agent_count==1     ：Controller(scene=<procthor_house>)     ，Unity  
+        # __init__  self.reset(scene)          "        Unity   +   FIFO +
+        #             （        /  /    ）"   ，   server_timeout（   100s）
+        #                    。            Mesa lavapipe（       ）      ，
+        #                    ，        TimeoutError（  procthor218/procthor705
+        #     "Reading from AI2-THOR backend timed out" ）。
+        #       ：       agent_count      ，       Controller（     scene，
+        #        ），        FIFO             ；        CreateHouse
+        #     scene，                       step() timeout    ，
+        #     Controller.__init__            timeout      。
+        deferred_procthor_load = True
         if deferred_procthor_load:
             controller_kwargs.pop("scene", None)
+            if self.agent_count > 1:
+                print(
+                    f"  • Multi-agent embodied mode: deferred CreateHouse + "
+                    f"Initialize(agentCount={self.agent_count})"
+                )
+            else:
+                print(
+                    "  • Deferred CreateHouse: launching Controller with an empty scene "
+                    "first, then loading the procedural house via a separate step() call "
+                    "(avoids cramming Unity startup + full house generation into a single "
+                    "server_timeout window)"
+                )
+
+        controller_class = (
+            Controller
+            if self.force_vulkan_device_index is None
+            else _ControllerWithForcedVulkanDevice
+        )
+        forced_device_kwargs = {}
+        if self.force_vulkan_device_index is not None:
+            forced_device_kwargs["force_vulkan_device_index"] = int(
+                self.force_vulkan_device_index
+            )
             print(
-                f"  • Multi-agent embodied mode: deferred CreateHouse + "
-                f"Initialize(agentCount={self.agent_count})"
+                "  • Forcing direct Vulkan device index: "
+                f"{self.force_vulkan_device_index} (no CUDA/NVIDIA mapping)"
             )
 
         try:
-            self.controller = Controller(**controller_kwargs)
+            self.controller = controller_class(
+                **controller_kwargs, **forced_device_kwargs
+            )
         except TypeError as e:
             # Backward compatibility: some AI2-THOR builds use timeout instead of server_timeout
             if "unexpected keyword argument 'server_timeout'" in str(e):
@@ -524,7 +701,68 @@ class ProcTHOREnvWrapper(BaseEnv):
                 controller_kwargs["timeout"] = self.controller_timeout
             if "unexpected keyword argument 'server_start_timeout'" in str(e):
                 controller_kwargs.pop("server_start_timeout", None)
-            self.controller = Controller(**controller_kwargs)
+            self.controller = controller_class(
+                **controller_kwargs, **forced_device_kwargs
+            )
+        except ValueError as e:
+            #     ai2thor.controller.Controller.find_build()：
+            #   "Invalid commit_id: <hash> - no build exists for arch=Linux platforms=CloudRendering"
+            #      commit_id  ai2thor pip           COMMIT_ID（ai2thor._builds.COMMIT_ID），
+            # find_build()   ai2thor.build.Build.exists()  requests.head(
+            #   "http://s3-us-west-2.amazonaws.com/ai2-thor-public/builds/...") ；
+            #                （    ）， requests.head       ，
+            #        ，   Controller       ValueError（     TimeoutError）
+            if "no build exists" in str(e) or "Invalid commit_id" in str(e):
+                raise RuntimeError(
+                    "\n"
+                    "❌ AI2-THOR/ProcTHOR Unity build lookup failed: 无法找到/下载与当前 ai2thor 包版本匹配的 Unity build。\n"
+                    f"   原始报错: {e}\n"
+                    "   根因排查：该报错来自 ai2thor.controller.Controller.find_build()，其内部会向\n"
+                    "   http://s3-us-west-2.amazonaws.com/ai2-thor-public/ (AWS S3 us-west-2) 发起 HTTP HEAD 请求，\n"
+                    "   检查该 commit_id 对应平台的 build 是否存在；当前机器/网络环境很可能无法访问该 S3 域名\n"
+                    "   （国内内网/无出网代理的机器上常见），导致 exists() 恒为 False，从而报 'no build exists'。\n"
+                    "   经验证：配置好可访问 AWS S3 (us-west-2) 的 HTTP(S) 代理后，该 commit_id 对应的\n"
+                    "   CloudRendering build 确实存在，问题可以解决。\n"
+                    "   解决方案（任选其一，推荐 2）：\n"
+                    "   1) 在可以访问 AWS S3 的机器上运行一次相同的 ai2thor 版本，让其自动下载 build 到\n"
+                    "      ~/.ai2thor/releases/，然后把该目录（或其中的 build 文件夹）拷贝到本机同路径，\n"
+                    "      或者拷贝后在配置文件 env.local_executable_path 中指向其中的可执行文件路径\n"
+                    "      （或设置环境变量 AI2THOR_LOCAL_EXECUTABLE_PATH），从而完全跳过网络请求。\n"
+                    "   2) 在配置文件 env.http_proxy / env.https_proxy（或标准环境变量 HTTP_PROXY/HTTPS_PROXY）\n"
+                    "      中配置一个可访问 s3-us-west-2.amazonaws.com 的 HTTP(S) 代理，\n"
+                    "      使 requests.head()/download() 能够正常工作。同时建议设置 env.ai2thor_home\n"
+                    "      指向一个持久化的绝对路径，避免下载好的 build 缓存随 $HOME 失效。\n"
+                    "   3) 在配置文件 env.commit_id（或环境变量 AI2THOR_COMMIT_ID）中显式指定一个已知在\n"
+                    "      当前网络环境下可正常拉取的 commit_id（例如与本机 AI2-THOR 环境实测可用的版本保持一致）。\n"
+                ) from e
+            raise
+        except Exception as e:
+            # ai2thor.controller.Controller.find_build() 在找到 build 但平台校验（platform.validate）
+            # 失败时会抛出普通 Exception，最常见的是 CloudRendering 缺少 Vulkan Loader：
+            #   "Platform CloudRendering failed validation with the following errors: Vulkan API driver missing.
+            #    CloudRendering requires libvulkan1. Please install by running: sudo apt-get -y install libvulkan1"
+            # 这与网络无关（build 已经找到/校验完毕），纯粹是当前机器缺少 libvulkan.so.1，
+            # 且很多计算节点没有 root 权限执行 apt-get install。
+            if "Vulkan API driver missing" in str(e) or "libvulkan1" in str(e):
+                raise RuntimeError(
+                    "\n"
+                    "❌ AI2-THOR/ProcTHOR CloudRendering platform validation failed: 当前机器缺少 Vulkan Loader (libvulkan.so.1)。\n"
+                    f"   原始报错: {e}\n"
+                    "   根因：ai2thor.platform.CloudRendering.validate() 用 ctypes.util.find_library('vulkan')\n"
+                    "   检测 libvulkan.so.1 是否存在；很多计算节点没有 root 权限执行\n"
+                    "   'sudo apt-get -y install libvulkan1'。\n"
+                    "   解决方案（无需 root 权限，任选其一）：\n"
+                    "   1) 在配置文件 env.ai2thor_ld_library_path（或环境变量 AI2THOR_LD_LIBRARY_PATH）中\n"
+                    "      指定一个包含 libvulkan.so.1 的目录（例如通过 conda 安装的\n"
+                    "      'conda install -c conda-forge vulkan-loader' 环境的 lib 目录，或另一个已能正常\n"
+                    "      运行 ai2thor 的 conda/venv 环境的 lib 目录），会被合并进 LD_LIBRARY_PATH。\n"
+                    "   2) 如果没有 GPU 厂商的 Vulkan ICD（如 nvidia_icd.json），可以额外用 conda-forge 的\n"
+                    "      mesa 软件渲染兜底：conda install -c conda-forge mesa，然后把其 lib 目录加入\n"
+                    "      env.ai2thor_ld_library_path，并在 env.ai2thor_vk_icd_filenames（或环境变量\n"
+                    "      AI2THOR_VK_ICD_FILENAMES）中指向其 share/vulkan/icd.d/lvp_icd.x86_64.json。\n"
+                    "      注意：软件渲染 (lavapipe) 性能远低于硬件 GPU 渲染，仅作为兜底方案。\n"
+                ) from e
+            raise
 
         if deferred_procthor_load:
             # CreateHouse        lastActionSuccess=False（NullReferenceException），  house
@@ -538,24 +776,29 @@ class ProcTHOREnvWrapper(BaseEnv):
                 )
             except Exception as e:
                 print(f"⚠️  CreateHouse failed: {e}")
-            try:
-                init_ev = self.controller.step(
-                    action="Initialize",
-                    agentCount=self.agent_count,
-                    gridSize=self.grid_size,
-                    visibilityDistance=self.visibility_distance,
-                    renderDepthImage=self.render_depth_image,
-                    renderInstanceSegmentation=self.render_instance_segmentation,
-                    fieldOfView=self.field_of_view,
-                )
-                ok = bool(init_ev.metadata.get("lastActionSuccess", True))
-                n_evs = len(init_ev.events) if hasattr(init_ev, "events") else 1
-                print(
-                    f"✓ Re-Initialize(agentCount={self.agent_count}): "
-                    f"ok={ok}, events={n_evs}"
-                )
-            except Exception as e:
-                print(f"⚠️  Re-Initialize(agentCount={self.agent_count}) failed: {e}")
+            # agent_count==1     ：CreateHouse                agent    /   ，
+            #      Initialize(agentCount=1)（         respawn agent          ，
+            #                 ，                  ）。
+            #    agent（agent_count>1）    Initialize(agentCount=N)     agents。
+            if self.agent_count > 1:
+                try:
+                    init_ev = self.controller.step(
+                        action="Initialize",
+                        agentCount=self.agent_count,
+                        gridSize=self.grid_size,
+                        visibilityDistance=self.visibility_distance,
+                        renderDepthImage=self.render_depth_image,
+                        renderInstanceSegmentation=self.render_instance_segmentation,
+                        fieldOfView=self.field_of_view,
+                    )
+                    ok = bool(init_ev.metadata.get("lastActionSuccess", True))
+                    n_evs = len(init_ev.events) if hasattr(init_ev, "events") else 1
+                    print(
+                        f"✓ Re-Initialize(agentCount={self.agent_count}): "
+                        f"ok={ok}, events={n_evs}"
+                    )
+                except Exception as e:
+                    print(f"⚠️  Re-Initialize(agentCount={self.agent_count}) failed: {e}")
 
         print("✓ Controller initialized")
         

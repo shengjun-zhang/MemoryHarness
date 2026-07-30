@@ -18,11 +18,13 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -51,6 +53,8 @@ os.environ.setdefault(
 )
 
 from .config import load_config
+from mllm_base_agent.task_sharding import resolve_shard_config, shard_tasks
+from mllm_base_agent.subprocess_streaming import run_task_subprocess_streaming
 from scripts.ai2thor.run_benchmark import (  #        benchmark
     build_csv_extra_fields,
     count_csv_status,
@@ -133,7 +137,7 @@ def resolve_dual_agent_csv_path(csv_arg: Optional[str]) -> Optional[Path]:
 
 
 def find_completed_tasks(output_dir: str, save_name: Optional[str] = None) -> set:
-    """    dual benchmark            """
+    """    dual benchmark            （        shard-XXX      ）"""
     completed = set()
     output_path = Path(output_dir)
 
@@ -154,14 +158,30 @@ def find_completed_tasks(output_dir: str, save_name: Optional[str] = None) -> se
         reverse=True,
     )
 
-    for benchmark_dir in benchmark_dirs:
-        for task_dir in benchmark_dir.iterdir():
+    def _scan_task_dirs(run_dir: Path) -> None:
+        for task_dir in run_dir.iterdir():
             if not task_dir.is_dir():
                 continue
             if task_dir.name in {"task_logs", "failed_logs"}:
                 continue
             if find_result_json(str(task_dir)):
                 completed.add(normalize_task_id(task_dir.name))
+
+    for benchmark_dir in benchmark_dirs:
+        shard_dirs = sorted(
+            (
+                d
+                for d in benchmark_dir.iterdir()
+                if d.is_dir() and d.name.startswith("shard-")
+            ),
+            key=lambda x: x.name,
+            reverse=True,
+        )
+        # 新版嵌套布局：<save_name>_<time>/shard-XXX/<task_id>/
+        # 旧版平铺布局：<save_name>_shard-XXX-of-YYY_<time>/<task_id>/
+        run_dirs = shard_dirs or [benchmark_dir]
+        for run_dir in run_dirs:
+            _scan_task_dirs(run_dir)
 
     return completed
 
@@ -666,6 +686,30 @@ Examples:
     parser.add_argument("--csv", type=str, default=None, help="   CSV   ")
     parser.add_argument("--workers", type=int, default=4, help="   worker  ")
     parser.add_argument(
+        "--task-timeout-seconds",
+        type=int,
+        default=0,
+        help="单个任务超时秒数；0 表示不限制（集群排障建议设置，例如 7200）",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=None,
+        help="跨机器任务分片总数；默认从 TASK_NUM_SHARDS/WORLD_SIZE/AFO 集群信息读取",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help="当前机器的分片编号（从 0 开始）；默认从 TASK_SHARD_INDEX/RANK/AFO 集群信息读取",
+    )
+    parser.add_argument(
+        "--shard-strategy",
+        choices=["round_robin", "contiguous"],
+        default="round_robin",
+        help="任务分片策略：轮询分配（默认，较均衡）或连续区间",
+    )
+    parser.add_argument(
         "--config",
         type=str,
         default=_DEFAULT_DUAL_AGENT_CONFIG,
@@ -709,6 +753,68 @@ Examples:
     parser.add_argument("--sequential", action="store_true", help="      ")
     parser.add_argument("--skip-completed", action="store_true", help="       ")
     parser.add_argument(
+        "--rerun-all",
+        action="store_true",
+        help="重新运行 CSV 中所有任务（包括已标记为 true/false 的任务）；默认只运行 Completed 为空(null) 的任务",
+    )
+    parser.add_argument(
+        "--history-feedback",
+        action="store_true",
+        help="开启历史反馈模式：将每步动作及执行结果（含距离错误）注入 agent 历史，使其能跨步推理（透传给 main.py）",
+    )
+    parser.add_argument(
+        "--llm-history-feedback",
+        action="store_true",
+        help=(
+            "开启 LLM 历史分析 Agent：额外生成一个与当前 agent 相同的大模型，"
+            "对各 agent 近期 动作-结果 历史进行管理与分析，产出高信息量、"
+            "可指导动作的逐条注记，用以替换 --history-feedback 注入的原始 "
+            "action+error 文本。关闭时不影响 --history-feedback（透传给 main.py）"
+        ),
+    )
+    parser.add_argument(
+        "--image-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "发送给 VLM 的图像降采样倍数（0 < scale <= 1.0，透传给 main.py）。"
+            "例如 --image-scale 0.5 会把 800x600 缩到 400x300 再 base64 编码，"
+            "显著减小请求体、避免长 episode 触发 HTTP 413。默认 1.0 = 不缩放（原行为）"
+        ),
+    )
+    parser.add_argument(
+        "--image-recent-steps",
+        type=int,
+        default=0,
+        help=(
+            "临近当前 step 的 K 个历史图片保持原始分辨率（800x600），更久远的"
+            "历史图片使用 --image-scale 缩放（透传给 main.py）。当前观测图片始终"
+            "为原始分辨率。例如 --image-recent-steps 3 保留最近 3 张历史图片"
+            "原始大小，仅缩放更早的。默认 0 = 仅当前观测为原始分辨率，所有历史"
+            "图片按 --image-scale 缩放（原行为）。"
+        ),
+    )
+    parser.add_argument(
+        "--partner-view",
+        action="store_true",
+        help=(
+            "开启伙伴视角注入：每个决策步还额外给模型一张从伙伴身体当前相机"
+            "实时渲染的第一视角图片（透传给 main.py）。这让当前 agent 能从不同"
+            "角度观察共享场景，并核对伙伴汇报的发现。仅在 env 有 2 个实体 agent"
+            "时生效。默认关闭（原行为：每个 agent 只看自己的视角）。"
+        ),
+    )
+    parser.add_argument(
+        "--partner-view-scale",
+        type=float,
+        default=None,
+        help=(
+            "伙伴视角图片的降采样倍数（0 < scale <= 1.0，透传给 main.py）。"
+            "默认与 --image-scale 一致（伙伴图片作为辅助输入，与历史图片同样"
+            "缩放）。设为 1.0 可保持伙伴图片为原始 800x600 分辨率。"
+        ),
+    )
+    parser.add_argument(
         "--outputs-completed-dir",
         type=str,
         default=_DEFAULT_OUTPUTS_COMPLETED_DIR,
@@ -735,6 +841,11 @@ Examples:
 
     args = parser.parse_args()
 
+    try:
+        shard_config = resolve_shard_config(args.num_shards, args.shard_index)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     config_path = Path(args.config)
     if not config_path.exists():
         print(f"❌ Config file not found: {config_path}")
@@ -753,11 +864,18 @@ Examples:
         print(f"📋 Explicit task list: {task_ids[:5]}")
     elif csv_path:
         print(f"📋 Reading task IDs from CSV: {csv_path}")
-        task_ids = read_task_ids_from_csv(str(csv_path), only_null=True)
+        only_null = not args.rerun_all
+        task_ids = read_task_ids_from_csv(str(csv_path), only_null=only_null)
         if not task_ids:
-            print("❌ No task IDs with Completed=null in CSV")
+            if only_null:
+                print("❌ No task IDs with Completed=null in CSV")
+            else:
+                print("❌ No task IDs found in CSV")
             sys.exit(1)
-        print(f"✓ Found {len(task_ids)} tasks with Completed=null")
+        if only_null:
+            print(f"✓ Found {len(task_ids)} tasks with Completed=null")
+        else:
+            print(f"✓ Found {len(task_ids)} tasks (rerun-all mode, including completed true/false)")
     else:
         print(f"📋 Loading tasks from config: {config_path}")
         config = load_config(str(config_path))
@@ -771,7 +889,28 @@ Examples:
     if len(task_ids) > 5:
         print(f"  ... (total {len(task_ids)} tasks)")
 
-    if args.skip_completed:
+    unique_task_ids, duplicate_task_ids = deduplicate_task_ids(task_ids)
+    if duplicate_task_ids:
+        print(f"⚠️  Found {len(duplicate_task_ids)} duplicated task IDs; duplicates will be skipped")
+    task_ids = unique_task_ids
+
+    unsharded_task_count = len(task_ids)
+    task_ids = shard_tasks(task_ids, shard_config, args.shard_strategy)
+    if shard_config.enabled:
+        print(
+            f"🔀 Task shard {shard_config.shard_index}/{shard_config.num_shards} "
+            f"({args.shard_strategy}, source={shard_config.source}): "
+            f"selected {len(task_ids)}/{unsharded_task_count} tasks"
+        )
+
+    if not task_ids:
+        print("✓ This shard has no tasks to run")
+        sys.exit(0)
+
+    if args.rerun_all and args.skip_completed:
+        print("⚠️  --rerun-all 已启用，忽略 --skip-completed（强制重跑所有任务，不做断点续跑）")
+
+    if args.skip_completed and not args.rerun_all:
         print("\n🔍 Checking completed tasks from previous dual benchmark dirs...")
         completed_tasks = find_completed_tasks(args.output_dir, args.save_name)
         if completed_tasks:
@@ -790,13 +929,8 @@ Examples:
         else:
             print("✓ No completed tasks found, will run all")
 
-    unique_task_ids, duplicate_task_ids = deduplicate_task_ids(task_ids)
-    if duplicate_task_ids:
-        print(f"⚠️  Found {len(duplicate_task_ids)} duplicated task IDs; duplicates will be skipped")
-    task_ids = unique_task_ids
-
     if not task_ids:
-        print("❌ No tasks to run")
+        print("✓ All tasks assigned to this shard are completed")
         sys.exit(0)
 
     actual_config_path, temp_config_path = prepare_benchmark_config(
@@ -805,12 +939,27 @@ Examples:
         collaboration_mode=args.collaboration_mode,
     )
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # 多 shard 并行运行时，各 shard 进程由 launch_dual_benchmark.sh 注入同一个
+    # BENCHMARK_RUN_TIMESTAMP，从而共享同一个实验目录 <save_name>_<timestamp>/，
+    # 再各自写入其下的 shard-XXX/ 子目录，避免像过去那样各 shard 各自生成时间戳、
+    # 平铺出多个互不相关的顶层目录。未设置该环境变量时（如本地单机调试）回退到
+    # 当前时间戳，行为与之前一致。
+    timestamp = os.environ.get("BENCHMARK_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d_%H%M%S")
+    if not re.fullmatch(r"\d{8}_\d{6}", timestamp):
+        print(f"❌ Invalid BENCHMARK_RUN_TIMESTAMP: {timestamp} (expected YYYYMMDD_HHMMSS)")
+        sys.exit(2)
     if args.save_name:
         prefix = args.save_name
     else:
         prefix = "dual_benchmark_sequential" if args.sequential else "dual_benchmark"
-    benchmark_output_dir = Path(args.output_dir) / f"{prefix}_{timestamp}"
+    experiment_output_dir = Path(args.output_dir) / f"{prefix}_{timestamp}"
+    if shard_config.enabled:
+        # 一个实验时间戳目录下按 shard 再分子目录，避免并行 shard 互相覆盖文件，
+        # 同时保证所有 shard 都能被聚合到同一个 <save_name>_<timestamp>/ 目录中。
+        shard_name = f"shard-{shard_config.shard_index:03d}-of-{shard_config.num_shards:03d}"
+        benchmark_output_dir = experiment_output_dir / shard_name
+    else:
+        benchmark_output_dir = experiment_output_dir
     benchmark_output_dir.mkdir(parents=True, exist_ok=True)
     task_logs_dir = benchmark_output_dir / "task_logs"
     task_logs_dir.mkdir(parents=True, exist_ok=True)
@@ -818,12 +967,18 @@ Examples:
     failed_logs_dir.mkdir(parents=True, exist_ok=True)
     outputs_completed_path = Path(args.outputs_completed_dir)
     outputs_completed_path.mkdir(parents=True, exist_ok=True)
+    result_csv_path = csv_path
+    if csv_path and shard_config.enabled:
+        result_csv_path = benchmark_output_dir / f"{csv_path.stem}.shard-{shard_config.shard_index:03d}-of-{shard_config.num_shards:03d}.csv"
+        shutil.copy2(csv_path, result_csv_path)
+        print(f"Shard CSV (isolated writes): {result_csv_path}")
     csv_lock = Lock()
 
     print(f"\n{'=' * 80}")
     print(f"🚀 Starting {'sequential' if args.sequential else 'parallel'} dual-agent benchmark")
     print(f"{'=' * 80}")
     print(f"Total tasks: {len(task_ids)}")
+    print(f"Task shard: {shard_config.shard_index}/{shard_config.num_shards} ({args.shard_strategy})")
     print(f"Workers: {1 if args.sequential else args.workers}")
     print(f"Config: {actual_config_path}")
     if args.agent1:
@@ -841,9 +996,68 @@ Examples:
     print(f"{'=' * 80}\n")
 
     def execute_task(task_id: str) -> Dict[str, Any]:
+        # 整个函数体用最外层 try/except 兜底：无论内部（包括 load_task_metadata、
+        # mkdir 等在“正常”try 块之外的调用）抛出什么异常，都绝不让它冒泡到
+        # ThreadPoolExecutor / future.result()。否则单个任务的意外异常会导致
+        # 整个 shard 主进程崩溃退出（跳过写 benchmark_summary.json 的收尾逻辑），
+        # 让其余已经跑完/正在跑的任务的结果全部丢失且难以定位原因。
+        try:
+            return _execute_task_inner(task_id)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            tb = traceback.format_exc()
+            print(f"  ❌ {task_id} unhandled exception in execute_task: {exc}\n{tb}")
+            try:
+                (benchmark_output_dir / task_id).mkdir(parents=True, exist_ok=True)
+                write_missing_result_diagnostic(
+                    str(benchmark_output_dir / task_id),
+                    task_id,
+                    None,
+                    "",
+                    "",
+                    error_text=f"Unhandled exception in execute_task: {exc}\n{tb}",
+                )
+            except Exception:
+                pass
+            return {
+                "task_id": task_id,
+                "status": "failed_external",
+                # 未被 _execute_task_inner 自身捕获的异常（例如 load_task_metadata/
+                # mkdir 在 IO 抖动的网络文件系统上出错）比普通 API 波动更值得警惕，
+                # 归类为 external_error 而非 api_error。
+                "failure_type": "external_error",
+                "attempts": 1,
+                "duration": 0.0,
+                "success": False,
+                "golden_actions_count": None,
+                "actual_actions_count": None,
+                "golden_action": None,
+                "actual_actions": None,
+                "instruction": None,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "failure_reason": f"Unhandled exception in execute_task: {exc}",
+                "task_result": None,
+                "agent_1_steps": 0,
+                "agent_2_steps": 0,
+                "communication_events": 0,
+                "turn_count": 0,
+                "copied_to_completed": False,
+            }
+        finally:
+            with INFLIGHT_TASKS_LOCK:
+                INFLIGHT_TASKS.discard(normalize_task_id(task_id))
+
+    def _execute_task_inner(task_id: str) -> Dict[str, Any]:
         task_start_time = time.time()
         task_log_parts: List[str] = []
         task_status = "failed_external"
+        # failure_type_detail 记录更细粒度的失败分类，用于区分“API 波动”（瞬时、
+        # 不代表本机环境有问题，不应让整个 shard 非零退出）与“环境/未知异常”
+        # （更可能意味着本机/容器环境本身出了问题，值得让集群感知并重启）。
+        failure_type_detail: Optional[str] = None
         task_success = False
         copied_to_completed = False
         task_metadata = load_task_metadata(task_id)
@@ -879,6 +1093,7 @@ Examples:
                     "completion_tokens": token_stats["completion_tokens"],
                     "total_tokens": token_stats["total_tokens"],
                     "failure_reason": "Task already running (dedupe protection)",
+                    "failure_type": "external_error",
                     "task_result": None,
                     "agent_1_steps": 0,
                     "agent_2_steps": 0,
@@ -917,19 +1132,31 @@ Examples:
                 cmd.extend(["--recursion-limit", str(args.recursion_limit)])
             if args.switch_interval:
                 cmd.extend(["--switch-interval", str(args.switch_interval)])
+            if getattr(args, "history_feedback", False):
+                cmd.append("--history-feedback")
+            if getattr(args, "llm_history_feedback", False):
+                cmd.append("--llm-history-feedback")
+            _img_scale = float(getattr(args, "image_scale", 1.0) or 1.0)
+            if 0.0 < _img_scale < 1.0:
+                cmd.extend(["--image-scale", str(_img_scale)])
+            _img_recent_steps = int(getattr(args, "image_recent_steps", 0) or 0)
+            if _img_recent_steps > 0:
+                cmd.extend(["--image-recent-steps", str(_img_recent_steps)])
+            if getattr(args, "partner_view", False):
+                cmd.append("--partner-view")
+            _partner_view_scale = getattr(args, "partner_view_scale", None)
+            if _partner_view_scale is not None:
+                cmd.extend(["--partner-view-scale", str(_partner_view_scale)])
 
             execution_start_time = time.time()
-            result = subprocess.run(
-                cmd,
-                cwd=project_root,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=None,
+            return_code, stdout_text, execution_duration = run_task_subprocess_streaming(
+                cmd=cmd,
+                cwd=Path(project_root),
+                task_id=task_id,
+                task_output_dir=benchmark_task_output_dir,
+                timeout_seconds=args.task_timeout_seconds or None,
             )
-            execution_duration = time.time() - execution_start_time
-            stdout_text = result.stdout or ""
-            stderr_text = result.stderr or ""
+            stderr_text = ""
 
             if stdout_text:
                 task_log_parts.append("=== STDOUT ===\n")
@@ -961,7 +1188,7 @@ Examples:
 
             task_log_parts.append("=== Run info ===\n")
             task_log_parts.append(f"Command: {' '.join(cmd)}\n")
-            task_log_parts.append(f"Exit code: {result.returncode}\n")
+            task_log_parts.append(f"Exit code: {return_code}\n")
             task_log_parts.append(f"Duration: {execution_duration:.2f}s\n")
             task_log_parts.append(f"{'=' * 80}\n\n")
 
@@ -989,7 +1216,7 @@ Examples:
                         failure_reason_detail,
                     )
                     update_csv_task_record(
-                        csv_path,
+                        result_csv_path,
                         task_id,
                         status="true",
                         extra_fields=csv_extra_fields,
@@ -1014,7 +1241,8 @@ Examples:
                 if result_json:
                     if failure_reason in ("api_error", "env_error", "external_error") and csv_status != "false":
                         task_status = "failed_external"
-                        print(f"  ⚠️  {task_id} external failure -> null")
+                        failure_type_detail = failure_reason
+                        print(f"  ⚠️  {task_id} external failure ({failure_reason}) -> null")
                     else:
                         task_status = "failed_model"
                         print(f"  ❌ {task_id} model failure -> {csv_status}")
@@ -1028,7 +1256,7 @@ Examples:
 
                     if csv_path:
                         update_csv_task_record(
-                            csv_path,
+                            result_csv_path,
                             task_id,
                             status=csv_status,
                             extra_fields=csv_extra_fields,
@@ -1036,9 +1264,11 @@ Examples:
                         )
                 else:
                     task_status = "failed_external"
+                    failure_type_detail = "external_error"
                     failure_reason_detail = "No result JSON produced"
                     err_blob = f"{stderr_text}\n{stdout_text}".lower()
                     if "graphrecursionerror" in err_blob or "recursion limit" in err_blob:
+                        failure_type_detail = "recursion_limit"
                         failure_reason_detail = (
                             "GraphRecursionError: graph recursion_limit exceeded "
                             "(no dual_episode JSON saved; pull latest mllm_base_agent/dual_agent/ai2thor/main.py)"
@@ -1046,14 +1276,14 @@ Examples:
                     write_missing_result_diagnostic(
                         str(benchmark_task_output_dir),
                         task_id,
-                        result.returncode,
+                        return_code,
                         stdout_text,
                         stderr_text,
                         error_text=failure_reason_detail,
                     )
                     if csv_path:
                         update_csv_task_record(
-                            csv_path,
+                            result_csv_path,
                             task_id,
                             status=None,
                             extra_fields=csv_extra_fields,
@@ -1100,6 +1330,11 @@ Examples:
                     )
             else:
                 task_status = "failed_external"
+                # 主线程未捕获的异常（代码 bug、IO 异常等）比 API 错误更值得警惕，
+                # 归入 external_error 而不是 api_error，以便下面的 exit_code 判定仍然能
+                # 感知到这类非典型 API 波动的问题。若 failure_reason 本身已经是
+                # api_error/env_error 则保留原分类。
+                failure_type_detail = failure_reason if failure_reason in ("api_error", "env_error") else "external_error"
                 if not result_json:
                     write_missing_result_diagnostic(
                         str(benchmark_task_output_dir),
@@ -1112,7 +1347,7 @@ Examples:
 
             if csv_path:
                 update_csv_task_record(
-                    csv_path,
+                    result_csv_path,
                     task_id,
                     status=csv_status,
                     extra_fields=csv_extra_fields,
@@ -1127,6 +1362,7 @@ Examples:
         return {
             "task_id": task_id,
             "status": task_status,
+            "failure_type": failure_type_detail,
             "attempts": 1,
             "duration": task_duration,
             "success": task_success,
@@ -1151,8 +1387,22 @@ Examples:
     successful = 0
     failed_model = 0
     failed_external = 0
+    # failed_external 再细分：failed_api 是纯 API 波动（限流/超时/413 等瞬时问题，
+    # 任务已在 CSV 中标记为 null 供后续重跑，不代表本机/容器环境有问题）；
+    # failed_infra 是环境崩溃（env_error）、结果缺失、未捕获异常等更严重的问题，
+    # 更可能意味着当前机器/容器本身出了故障，值得让 exit_code 非零、触发集群感知重启。
+    failed_api = 0
+    failed_infra = 0
     copied_to_completed_count = 0
     exit_code = 0
+
+    def _bump_failed_external_counters(result: Dict[str, Any]) -> None:
+        nonlocal failed_external, failed_api, failed_infra
+        failed_external += 1
+        if result.get("failure_type") == "api_error":
+            failed_api += 1
+        else:
+            failed_infra += 1
 
     try:
         if args.sequential:
@@ -1173,7 +1423,7 @@ Examples:
                 elif result["status"] == "failed_model":
                     failed_model += 1
                 else:
-                    failed_external += 1
+                    _bump_failed_external_counters(result)
                 if result.get("copied_to_completed"):
                     copied_to_completed_count += 1
         else:
@@ -1200,7 +1450,7 @@ Examples:
                     elif result["status"] == "failed_model":
                         failed_model += 1
                     else:
-                        failed_external += 1
+                        _bump_failed_external_counters(result)
                     if result.get("copied_to_completed"):
                         copied_to_completed_count += 1
                     if HAS_TQDM:
@@ -1208,15 +1458,34 @@ Examples:
                             {
                                 "ok": successful,
                                 "model": failed_model,
-                                "external": failed_external,
+                                "api": failed_api,
+                                "infra": failed_infra,
                                 "copied": copied_to_completed_count,
                             }
                         )
     except KeyboardInterrupt:
         print("\n⚠️ User interrupt")
         exit_code = 1
+    except Exception as exc:
+        # 兜底：execute_task 本身已经不会再抛出非 KeyboardInterrupt 异常，但
+        # ThreadPoolExecutor/tqdm 等调度层代码理论上仍可能出问题。宁可在这里
+        # 记录清晰的异常堆栈并仍然写出已收集到的 task_records 的 summary，
+        # 也不要让主进程直接崩溃、丢失所有已完成任务的结果且无从排查原因。
+        print(f"\n❌ Unexpected error in task scheduling loop: {exc}")
+        traceback.print_exc()
+        exit_code = 1
     else:
-        exit_code = 0 if (failed_model + failed_external) == 0 else 1
+        # `failed_model` 是评测层面的正常负样本（例如模型误判 DONE / 达到最大步数），
+        # 属于预期内的 benchmark 结果，不应视为进程运行错误。
+        # `failed_api`（限流/超时/413 等 API 波动）同样不应让整个 shard 非零退出：
+        # 这类失败通常只是瞬时的、与当前机器/容器环境无关，任务已写回 CSV 为
+        # null，后续重跑（--skip-completed）会自动补跑，没必要因为个别任务撞上
+        # 一次 API 抖动就让 AFO 判定整个 worker task 失败、杀掉同一 worker 上其它
+        # 正常运行的任务。
+        # 只有 `failed_infra`（环境崩溃 env_error、结果缺失、未捕获异常等）才代表
+        # 本次 shard 运行本身/所在机器出了问题，才需要让进程以非零码退出（供集群
+        # 调度层据此重试/告警/重启容器）。
+        exit_code = 0 if failed_infra == 0 else 1
     finally:
         if temp_config_path and os.path.exists(temp_config_path):
             try:
@@ -1264,7 +1533,10 @@ Examples:
         if task_ids:
             f.write(f"Success: {successful} ({successful / len(task_ids) * 100:.1f}%)\n")
             f.write(f"Model failure: {failed_model} ({failed_model / len(task_ids) * 100:.1f}%)\n")
-            f.write(f"External failure: {failed_external} ({failed_external / len(task_ids) * 100:.1f}%)\n")
+            f.write(
+                f"External failure: {failed_external} ({failed_external / len(task_ids) * 100:.1f}%) "
+                f"[api: {failed_api}, infra: {failed_infra}]\n"
+            )
         f.write(f"Copied to {args.outputs_completed_dir}: {copied_to_completed_count}\n")
         f.write(f"Total time: {total_duration:.2f}s ({total_duration / 60:.2f} min)\n")
         f.write(f"Avg time: {avg_duration:.2f}s\n")
@@ -1305,6 +1577,7 @@ Examples:
     summary_json = {
         "timestamp": timestamp,
         "csv": str(csv_path) if csv_path else None,
+        "result_csv": str(result_csv_path) if result_csv_path else None,
         "config": str(config_path),
         "actual_config": str(actual_config_path),
         "agent1_config": args.agent1,
@@ -1314,12 +1587,25 @@ Examples:
         "workers": 1 if args.sequential else args.workers,
         "collaboration_mode": args.collaboration_mode,
         "max_steps": args.max_steps,
+        "task_timeout_seconds": args.task_timeout_seconds,
         "switch_interval": args.switch_interval,
         "headless": args.headless,
+        "history_feedback": getattr(args, "history_feedback", False),
+        "llm_history_feedback": getattr(args, "llm_history_feedback", False),
+        "image_scale": float(getattr(args, "image_scale", 1.0) or 1.0),
+        "image_recent_steps": int(getattr(args, "image_recent_steps", 0) or 0),
+        "partner_view": getattr(args, "partner_view", False),
+        "partner_view_scale": getattr(args, "partner_view_scale", None),
+        "num_shards": shard_config.num_shards,
+        "shard_index": shard_config.shard_index,
+        "shard_strategy": args.shard_strategy,
+        "unsharded_task_count": unsharded_task_count,
         "total_tasks": len(task_ids),
         "successful": successful,
         "failed_model": failed_model,
         "failed_external": failed_external,
+        "failed_api": failed_api,
+        "failed_infra": failed_infra,
         "copied_to_completed": copied_to_completed_count,
         "duration_seconds": total_duration,
         "avg_duration_seconds": avg_duration,
@@ -1336,7 +1622,7 @@ Examples:
     print(f"Total tasks: {len(task_ids)}")
     print(f"Success: {successful}")
     print(f"Model failure: {failed_model}")
-    print(f"External failure: {failed_external}")
+    print(f"External failure: {failed_external} (api: {failed_api}, infra: {failed_infra})")
     print(f"Copied to {args.outputs_completed_dir}: {copied_to_completed_count}")
     print(f"Agent 1 steps: {aggregate_agent_stats['agent_1_steps']}")
     print(f"Agent 2 steps: {aggregate_agent_stats['agent_2_steps']}")
@@ -1347,8 +1633,8 @@ Examples:
     print(f"Summary log: {summary_log_path}")
     print(f"Summary json: {summary_json_path}")
 
-    if csv_path:
-        csv_stats = count_csv_status(csv_path)
+    if result_csv_path:
+        csv_stats = count_csv_status(result_csv_path)
         print(f"\n{'=' * 80}")
         print("📊 CSV status")
         print(f"{'=' * 80}")

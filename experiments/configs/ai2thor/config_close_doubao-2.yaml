@@ -13,7 +13,46 @@ env:
   render_instance_segmentation: false
   text_state_mode: first_person
   visibility_distance: 1.0
-  platform: null
+  platform: CloudRendering
+  # gpu_device is intentionally disabled: it invokes nvidia-smi for CUDA/Vulkan UUID mapping.
+  # Mesa lavapipe exposes a CPU Vulkan device instead. Unity 2020 does not auto-select a CPU
+  # physical device (requestedDeviceIndex=-1), so select Vulkan device 0 directly.
+  force_vulkan_device_index: 0
+  server_start_timeout: 300
+  # Safety margin for the read timeout during Controller() scene initialization under
+  # Mesa lavapipe (pure CPU software rendering), which can be noticeably slower than the
+  # previous 100s default on loaded/CPU-only machines.
+  server_timeout: 300
+  # ---------------------------------------------------------------------------
+  # AI2-THOR network + runtime dependency configuration (see mllm_base_agent/
+  # environments/ai2thor/wrapper.py::_apply_ai2thor_env_overrides for details)
+  # ---------------------------------------------------------------------------
+  # Fixes "ValueError: Invalid commit_id: ... no build exists for arch=Linux
+  # platforms=CloudRendering" by routing the AWS S3 build-lookup/download through a proxy.
+  http_proxy: http://10.70.18.228:8412
+  https_proxy: http://10.70.18.228:8412
+  # Fixes "Platform CloudRendering failed validation ... Vulkan API driver missing.
+  # CloudRendering requires libvulkan1" without root/apt-get, by pointing LD_LIBRARY_PATH
+  # at a directory that already contains libvulkan.so.1. NOTE: ctypes.util.find_library()
+  # does NOT search the current conda/venv's own lib/ dir by default, so this must be set
+  # explicitly even when using the spatialworld-ai2thor env itself.
+  # NOTE: ctypes.util.find_library() does NOT search the active conda/venv's own lib/ dir
+  # by default, so this must be set explicitly even when running inside this same env.
+  ai2thor_ld_library_path: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/conda-envs/spatialworld-ai2thor/lib
+  # Optional Mesa lavapipe software-rendering fallback if no vendor GPU Vulkan ICD exists:
+  # ai2thor_vk_icd_filenames: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/conda-envs/mesa-vulkan/share/vulkan/icd.d/lvp_icd.x86_64.json
+  # NOTE: ai2thor_home is intentionally NOT set here. wrapper.py reads
+  # env.ai2thor_home with priority over the AI2THOR_HOME environment variable
+  # (env_config.get("ai2thor_home", os.environ.get("AI2THOR_HOME"))), so hardcoding
+  # a shared DolphinFS path here would silently override the *local* per-node/
+  # container cache path (AI2THOR_HOME) that hope/launch_*_benchmark.sh exports via
+  # seed_local_ai2thor_cache(). That reintroduces the cross-node fcntl.lockf()
+  # deadlock in ai2thor/util/lock.py (Controller() calling self._build.lock_sh())
+  # -- the exact "stuck forever right after AI2ThorEnvWrapper.__init__ starting,
+  # heartbeat forever, no further log lines" symptom. Let it fall back to the
+  # AI2THOR_HOME env var (local disk) instead; if you need to override it for a
+  # one-off local run, pass it via the AI2THOR_HOME/AI2THOR_LOCAL_HOME env vars,
+  # not here.
 
 max_steps: 30
 
@@ -24,12 +63,18 @@ context_management:
 model:
   vlm:
     provider: openai
-    model_name: doubao-seed-2-0-lite-260215
+    # Meituan AIGC gateway (OpenAI-compatible). AppId is used as the Bearer token.
+    model_name: Doubao-Seed-2.0-lite
     temperature: 1.0
     top_p: 0.9
     max_tokens: 4096
-    base_url: null
-    api_key: null
+    base_url: https://aigc.sankuai.com/v1/openai/native
+    api_key: "2011286628471992379"
+    # Doubao-specific: disable thinking mode so the model returns the action directly.
+    # Forwarded to the API payload via OpenAICompatibleChatModel.model_kwargs.
+    model_kwargs:
+      thinking:
+        type: disabled
 
 logging:
   stdout_verbose: true

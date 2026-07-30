@@ -23,6 +23,58 @@ env:
   # - CloudRendering: Headless mode (no X11 required, recommended for servers)
   # Can also be set via --headless command line argument
   platform: null
+  # Unity 2020 does not auto-select Mesa's CPU Vulkan device (requestedDeviceIndex=-1),
+  # which makes the CloudRendering process segfault before opening its FIFO. Select
+  # llvmpipe device 0 directly; AI2-THOR's gpu_device option is NVIDIA-only.
+  force_vulkan_device_index: 0
+  server_start_timeout: 300
+  dataset_dir: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/worldmodel/SpatialWorld/data/procthor-10k
+  dataset_split: train
+  # ---------------------------------------------------------------------------
+  # AI2-THOR/ProcTHOR network + runtime dependency configuration
+  # ---------------------------------------------------------------------------
+  # Root cause of "ValueError: Invalid commit_id: ... no build exists for arch=Linux
+  # platforms=CloudRendering": Controller() checks build availability against
+  # s3-us-west-2.amazonaws.com; on machines without outbound internet access this always
+  # fails. VERIFIED FIX: configuring an HTTP(S) proxy that can reach AWS S3 resolves this
+  # (the build DOES exist for the default commit_id once the network path works).
+  http_proxy: http://10.70.18.228:8412
+  https_proxy: http://10.70.18.228:8412
+  # After the proxy issue is fixed, Controller() may then fail with:
+  #   "Platform CloudRendering failed validation ... Vulkan API driver missing.
+  #    CloudRendering requires libvulkan1."
+  # This is unrelated to the network -- it means this machine lacks the Vulkan Loader
+  # (libvulkan.so.1), and most compute nodes have no root access to apt-get install it.
+  # Fix without root: point at a directory that already contains libvulkan.so.1 (e.g. the
+  # lib/ dir of a conda env where ai2thor already works, or one created via
+  # `conda install -c conda-forge vulkan-loader`). This directory is merged into
+  # LD_LIBRARY_PATH before Controller() is constructed.
+  ai2thor_ld_library_path: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/conda-envs/spatialworld-ai2thor/lib
+  # This machine lacks a working vendor GPU Vulkan ICD (real NVIDIA Vulkan driver causes the
+  # ai2thor Unity process to hang during init; root cause not yet fixed), so fall back to
+  # Mesa's lavapipe software Vulkan renderer (much slower, but works everywhere; see the
+  # mesa-vulkan conda env under the same conda-envs/ directory):
+  ai2thor_vk_icd_filenames: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/conda-envs/mesa-vulkan/share/vulkan/icd.d/lvp_icd.x86_64.json
+  # NOTE: ai2thor_home is intentionally NOT set here. wrapper.py reads
+  # env.ai2thor_home with priority over the AI2THOR_HOME environment variable
+  # (env_config.get("ai2thor_home", os.environ.get("AI2THOR_HOME"))), so hardcoding
+  # a shared DolphinFS path here would silently override the *local* per-node/
+  # container cache path (AI2THOR_HOME) that hope/launch_*_benchmark.sh exports via
+  # seed_local_ai2thor_cache(). That reintroduces the cross-node fcntl.lockf()
+  # deadlock in ai2thor/util/lock.py (Controller() calling self._build.lock_sh())
+  # -- the exact "stuck forever right after AI2ThorEnvWrapper.__init__ starting,
+  # heartbeat forever, no further log lines" symptom. Let it fall back to the
+  # AI2THOR_HOME env var (local disk) instead; if you need to override it for a
+  # one-off local run, pass it via the AI2THOR_HOME/AI2THOR_LOCAL_HOME env vars,
+  # not here.
+  # Optional alternative to the above: download the matching Unity build once on a machine
+  # that CAN reach AWS S3 (running the same ai2thor version auto-downloads it to
+  # ~/.ai2thor/releases/), copy that build directory to this machine, then point to it here
+  # (or set env var AI2THOR_LOCAL_EXECUTABLE_PATH instead):
+  # local_executable_path: /path/to/copied/thor-Linux64-<commit_id>/thor-Linux64-<commit_id>
+  # Alternatively, pin a specific commit_id known to be reachable from this network
+  # (or set env var AI2THOR_COMMIT_ID):
+  # commit_id: null
 
 # -----------------------------------------------------------------------------
 # Dual Agent Specific Configuration
@@ -48,12 +100,12 @@ context_management:
 model:
   vlm:
     provider: openai
-    model_name: doubao-seed-2-0-lite-260215
+    model_name: Doubao-Seed-2.0-lite
     temperature: 1.0
     top_p: 0.9
     max_tokens: 4096
-    base_url: null
-    api_key: null
+    base_url: https://aigc.sankuai.com/v1/openai/native
+    api_key: "2011286628471992379"
 
 # -----------------------------------------------------------------------------
 # Logging and Output Configuration

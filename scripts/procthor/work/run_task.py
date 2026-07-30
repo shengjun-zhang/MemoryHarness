@@ -11,6 +11,7 @@ import json
 import base64
 import time
 import argparse
+from io import BytesIO
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
@@ -40,6 +41,70 @@ LOCAL_RETRY_CONFIG = {
     "api_retry_delay": 5,
 }
 MODEL_HISTORY_TURNS = 29
+
+
+def _resolve_image_scale(config: dict) -> float:
+    """                image.scale                       。
+
+       1.0（      ，  base64  ，        ）；       (0, 1.0]，
+              /  />1                          。
+    """
+    try:
+        scale = float((config.get("image", {}) or {}).get("scale", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+    if scale <= 0.0 or scale > 1.0:
+        return 1.0
+    return scale
+
+
+def _resolve_image_recent_steps(config: dict) -> int:
+    """                    K              (image.recent_steps，  0)。
+
+    image.scale < 1.0    ，   K                      ，       image.scale。
+              （     ）           。
+    """
+    try:
+        recent_steps = int((config.get("image", {}) or {}).get("recent_steps", 0))
+    except (TypeError, ValueError):
+        return 0
+    if recent_steps < 0:
+        return 0
+    return recent_steps
+
+
+def _image_path_to_data_url(image_path: str, scale: float = 1.0) -> str:
+    """      base64  data URL；scale < 1.0    PIL      ，        413。
+
+    scale >= 1.0  PIL         ，                （    ）。
+    """
+    if not scale or scale >= 1.0:
+        with open(image_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/png;base64,{image_data}"
+    try:
+        from PIL import Image
+    except ImportError:
+        with open(image_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/png;base64,{image_data}"
+    try:
+        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+        with Image.open(image_path) as img:
+            w, h = img.size
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            img = img.convert("RGB")
+            if (new_w, new_h) != (w, h):
+                img = img.resize((new_w, new_h), resample)
+            buf = BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            image_data = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return f"data:image/png;base64,{image_data}"
+    except Exception:
+        with open(image_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/png;base64,{image_data}"
 
 
 class APIRetryError(Exception):
@@ -166,6 +231,14 @@ def save_episode_log(state: dict, output_dir: str, env) -> None:
 
 def run_agent_loop(env, vlm, task_config: dict, task_output_dir: str, config: dict, max_steps_override: int | None = None):
     """    agent   ：Think → Act → Evaluate，  ai2thor   （  API/  /    ） """
+    # Decision mode: 'standard' (default, unchanged behavior) or 'lookahead' (probe all
+    # candidate actions first, then let the model choose after seeing every resulting
+    # observation). Reuses the environment-agnostic helpers from mllm_base_agent's
+    # AgentRunner so both ai2thor (graph-based) and procthor (this standalone loop)
+    # share identical lookahead semantics.
+    decision_mode = str(config.get("decision", {}).get("mode", "standard") or "standard").lower()
+    if decision_mode == "lookahead":
+        from mllm_base_agent.agent.runner import _rollout_lookahead_candidates
     task_prompt = task_config.get("instruction") or task_config.get("description") or "Complete the task."
     max_steps = (
         int(max_steps_override)
@@ -193,6 +266,10 @@ def run_agent_loop(env, vlm, task_config: dict, task_output_dir: str, config: di
     #     N        ；       +assistant   ，           PNG base64            base64 decode fail
     _img_turns = ctx_mgmt.get("multimodal_history_image_turns")
     multimodal_image_turns = max_history if _img_turns is None else min(max_history, max(0, int(_img_turns)))
+    #                    （image.scale / image.recent_steps），            base64
+    #                                 413 Request Entity Too Large。
+    image_scale = _resolve_image_scale(config)
+    image_recent_steps = _resolve_image_recent_steps(config)
     consecutive_failures = 0
     success = False
     fail_reason = None
@@ -214,9 +291,9 @@ def run_agent_loop(env, vlm, task_config: dict, task_output_dir: str, config: di
             include_image = multimodal_image_turns > 0 and idx >= (n_hist - multimodal_image_turns)
             content = []
             if include_image and img_path and os.path.exists(img_path):
-                with open(img_path, "rb") as f:
-                    img_b64 = base64.b64encode(f.read()).decode("utf-8")
-                content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}})
+                distance_from_end = n_hist - idx
+                entry_scale = 1.0 if distance_from_end <= image_recent_steps else image_scale
+                content.append({"type": "image_url", "image_url": {"url": _image_path_to_data_url(img_path, scale=entry_scale)}})
             step_text = f"Step {step_id}"
             if not include_image:
                 step_text += (
@@ -254,6 +331,50 @@ def run_agent_loop(env, vlm, task_config: dict, task_output_dir: str, config: di
             {"type": "text", "text": f"Current step is Step {step_count}. Please output <THINK> and <ACTION> according to the rules above and the current observation."},
         ]
         messages.append(HumanMessage(content=current_content))
+
+        # Lookahead mode: tentatively execute every candidate action (navigation moves/turns
+        # plus interactions inferred from currently-visible objects), show the model each
+        # resulting image, then roll the environment back before the "real" step below.
+        lookahead_rollouts = []
+        if decision_mode == "lookahead":
+            try:
+                lookahead_rollouts = _rollout_lookahead_candidates({"env": env, "observation": observation, "config": config})
+            except Exception as e:
+                print(f"⚠️  Lookahead candidate rollout failed, falling back to standard decision for this step: {e}")
+                lookahead_rollouts = []
+            if lookahead_rollouts:
+                lookahead_content = [{
+                    "type": "text",
+                    "text": (
+                        "Lookahead preview: each candidate action below has ALREADY been tentatively "
+                        "executed from the current position and then undone, so you can see its exact "
+                        "resulting view before deciding. Choose ONE action from this list (or DONE/FAIL) "
+                        "as your <ACTION> for this step; it will then be executed for real."
+                    ),
+                }]
+                for idx, rollout in enumerate(lookahead_rollouts, 1):
+                    label = f"Candidate {idx}: {rollout['action_string']}"
+                    if rollout.get("error_message"):
+                        label += f" (execution failed: {rollout['error_message']})"
+                    lookahead_content.append({"type": "text", "text": label})
+                    cand_image_path = rollout.get("image_path")
+                    if cand_image_path and os.path.exists(cand_image_path):
+                        try:
+                            # NOTE: candidate preview images are auxiliary (like history
+                            # images) and a single step can carry many of them (6 nav +
+                            # up to max_interaction_candidates interaction candidates).
+                            # Left at full resolution they dominate the request body and
+                            # are the main cause of HTTP 413 in lookahead mode even when
+                            # --image-scale is set (that flag previously only downscaled
+                            # HISTORY images, not lookahead candidates). Reuse the same
+                            # image_scale here so --image-scale also bounds these.
+                            lookahead_content.append({
+                                "type": "image_url",
+                                "image_url": {"url": _image_path_to_data_url(cand_image_path, scale=image_scale)},
+                            })
+                        except Exception:
+                            lookahead_content.append({"type": "text", "text": "[Candidate image unavailable]"})
+                messages.append(HumanMessage(content=lookahead_content))
 
         # Stage 1: API retry (  ai2thor think_node   )
         response_text = None
@@ -339,6 +460,7 @@ def run_agent_loop(env, vlm, task_config: dict, task_output_dir: str, config: di
             structured_trajectory.append({
                 "step": step_count, "thinking": thinking_text, "action_string": action_string, "action": action_dict,
                 "raw_response": response_text, "image_path": image_path, "reward": 10.0 if success else 0,
+                "lookahead_candidates": [r["action_string"] for r in lookahead_rollouts],
             })
             break
 
@@ -357,6 +479,7 @@ def run_agent_loop(env, vlm, task_config: dict, task_output_dir: str, config: di
         structured_trajectory.append({
             "step": step_count, "thinking": thinking_text, "action_string": action_string, "action": action_dict,
             "raw_response": response_text, "error_message": error_message, "image_path": image_path, "reward": step_reward,
+            "lookahead_candidates": [r["action_string"] for r in lookahead_rollouts],
         })
         short_term_history.append({"step": step_count, "image_path": image_path, "raw_response": response_text})
 
@@ -399,10 +522,93 @@ def main():
     parser.add_argument("--headless", action="store_true", help="Headless mode")
     parser.add_argument("--max-steps", type=int, default=None, help="Override max_steps")
     parser.add_argument("--print-config", action="store_true", help="Print config and exit")
+    parser.add_argument(
+        "--image-scale",
+        type=float,
+        default=None,
+        help=(
+            "Downscale factor for HISTORY images sent to the VLM (0 < scale <= 1.0). "
+            "e.g. --image-scale 0.5 resizes 800x600 -> 400x300 before base64 encoding, "
+            "shrinking the request body and avoiding HTTP 413 on long multi-image episodes. "
+            "The current-step observation is always full-resolution. Default: no scaling "
+            "(uses config.image.scale if set, otherwise 1.0)."
+        ),
+    )
+    parser.add_argument(
+        "--image-recent-steps",
+        type=int,
+        default=None,
+        help=(
+            "Number of most-recent history steps whose images are kept at original "
+            "resolution; older history images are downscaled to --image-scale. Only "
+            "meaningful when --image-scale < 1.0. Default: uses config.image.recent_steps "
+            "if set, otherwise 0."
+        ),
+    )
+    parser.add_argument(
+        "--decision-mode",
+        type=str,
+        default=None,
+        choices=["standard", "lookahead"],
+        help=(
+            "Per-step decision strategy. 'standard' (default): the model picks one action "
+            "directly from the current observation, which is then executed. 'lookahead': "
+            "before asking the model to decide, every candidate discrete action (navigation "
+            "moves/turns plus interactions inferred from currently-visible objects) is "
+            "tentatively executed to obtain its resulting image, then rolled back; the model "
+            "then chooses which action to actually commit after seeing all candidate outcomes. "
+            "Default: uses config.decision.mode if set, otherwise 'standard' (no behavior change)."
+        ),
+    )
+    parser.add_argument(
+        "--history-window-size",
+        type=int,
+        default=None,
+        help=(
+            "Number of most-recent steps kept in the short-term multimodal history sent to "
+            "the VLM (overrides config.context_management.short_term_history_window_size). "
+            "Smaller values shrink the per-request payload (fewer history images), which "
+            "helps avoid HTTP 413 Request Entity Too Large on long episodes, at the cost of "
+            "less context for the model. Default: uses config.context_management."
+            "short_term_history_window_size if set, otherwise the built-in cap (29)."
+        ),
+    )
     args = parser.parse_args()
 
     print(f"\n{'=' * 60}\n🔧 Loading Configuration\n{'=' * 60}\nConfig file: {args.config}")
     config = load_config(args.config)
+
+    if args.image_scale is not None:
+        _image_scale = float(args.image_scale)
+        if _image_scale <= 0.0 or _image_scale > 1.0:
+            print(f"⚠️  --image-scale {_image_scale} out of range (0, 1.0]; ignoring (no scaling)")
+            _image_scale = 1.0
+        config.update("image.scale", _image_scale)
+        if _image_scale < 1.0:
+            print(
+                f"✓ Image downscale: enabled (scale={_image_scale}, 800x600 -> "
+                f"{int(round(800 * _image_scale))}x{int(round(600 * _image_scale))})"
+            )
+    if args.image_recent_steps is not None:
+        _image_recent_steps = int(args.image_recent_steps)
+        if _image_recent_steps < 0:
+            print(f"⚠️  --image-recent-steps {_image_recent_steps} < 0; treating as 0")
+            _image_recent_steps = 0
+        config.update("image.recent_steps", _image_recent_steps)
+        print(f"✓ Image recent-steps: keeping the {_image_recent_steps} most-recent history images at full resolution")
+
+    if args.decision_mode is not None:
+        config.update("decision.mode", args.decision_mode)
+        print(f"✓ Decision mode overridden: {args.decision_mode}")
+
+    if args.history_window_size is not None:
+        _history_window_size = int(args.history_window_size)
+        if _history_window_size < 0:
+            print(f"⚠️  --history-window-size {_history_window_size} < 0; treating as 0")
+            _history_window_size = 0
+        config.update("context_management.short_term_history_window_size", _history_window_size)
+        print(f"✓ Short-term history window size overridden: {_history_window_size}")
+
     if args.print_config:
         from config import print_config
         print_config(config)
@@ -430,6 +636,7 @@ def main():
         base_url=vlm_config.get("base_url"),
         api_key=vlm_config.get("api_key"),
         proxy_url=vlm_config.get("proxy_url"),
+        model_kwargs=vlm_config.get("model_kwargs"),
     )
 
     all_results = []

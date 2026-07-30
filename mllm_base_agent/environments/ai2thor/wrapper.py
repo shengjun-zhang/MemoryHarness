@@ -6,8 +6,10 @@ Update: Supports loading environment, task, action, and reward parameters from Y
 """
 
 import os
+import sys
 import json
 import math
+import threading
 from typing import Optional, Callable, List, Dict, Any, Tuple
 from datetime import datetime
 from PIL import Image
@@ -19,8 +21,75 @@ try:
 except ImportError:
     print("Warning: ai2thor not installed, please run 'pip install ai2thor'")
 
+
+class _ControllerWithForcedVulkanDevice(ai2thor.controller.Controller):
+    """Controller variant that can select a Vulkan device without CUDA/NVIDIA mapping.
+
+    Upstream ``gpu_device`` always invokes ``nvidia-smi`` to map a CUDA index to a
+    Vulkan index. That cannot work on CPU-only lavapipe nodes, while old Unity
+    versions may fail to auto-select a CPU Vulkan physical device. Appending
+    Unity's native ``-force-device-index`` argument handles that case directly.
+    """
+
+    def __init__(self, *args: Any, force_vulkan_device_index: int, **kwargs: Any):
+        self.force_vulkan_device_index = int(force_vulkan_device_index)
+        super().__init__(*args, **kwargs)
+
+    def unity_command(self, width: int, height: int, headless: bool) -> List[str]:
+        command = super().unity_command(width, height, headless)
+        command.extend(["-force-device-index", str(self.force_vulkan_device_index)])
+        return command
+
 from core.llm.schemas import EnvAction, EnvObservation
 from envs.base import BaseEnv
+
+
+def _log_ts(message: str) -> None:
+    """Print a message prefixed with a wall-clock timestamp.
+
+    Used around long-running / potentially-hanging steps (e.g. launching the
+    AI2-THOR Unity subprocess) so that cluster job logs show *when* each stage
+    started/finished, making it possible to tell "still working" apart from
+    "stuck" without waiting for the whole run to finish.
+    """
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+
+
+def _list_descendant_pids(root_pid: int) -> List[int]:
+    """Return all descendant PIDs of ``root_pid`` via /proc (Linux only).
+
+    Standard-library-only replacement for ``psutil.Process(pid).children(recursive=True)``
+    (psutil is not installed in the ai2thor conda env), used by the Controller() hard
+    timeout watchdog to find and kill a stuck Unity subprocess.
+    """
+    try:
+        all_pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return []
+
+    children_by_ppid: Dict[int, List[int]] = {}
+    for pid in all_pids:
+        try:
+            with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="ignore") as f:
+                # Format: pid (comm) state ppid ...  -- comm can contain spaces/parens,
+                # so split on the LAST ')' to safely recover the fields after it.
+                stat = f.read()
+            after_comm = stat.rsplit(")", 1)[-1].split()
+            ppid = int(after_comm[1])  # state is after_comm[0], ppid is after_comm[1]
+        except (OSError, IndexError, ValueError):
+            continue
+        children_by_ppid.setdefault(ppid, []).append(pid)
+
+    descendants: List[int] = []
+    frontier = [root_pid]
+    while frontier:
+        next_frontier: List[int] = []
+        for pid in frontier:
+            for child_pid in children_by_ppid.get(pid, []):
+                descendants.append(child_pid)
+                next_frontier.append(child_pid)
+        frontier = next_frontier
+    return descendants
 
 
 # ============================================================================
@@ -85,8 +154,12 @@ class AI2ThorEnvWrapper(BaseEnv):
             output_dir: Output directory
             config: Complete configuration dictionary loaded from YAML (optional)
         """
+        _log_ts(f"🏗️  [STAGE] AI2ThorEnvWrapper.__init__ starting (scene={scene})")
+
         # Call parent class initialization
+        _log_ts("  [SUBSTAGE] super().__init__(config) starting")
         super().__init__(config)
+        _log_ts("  [SUBSTAGE] super().__init__(config) done")
 
         # Save configuration reference (override parent's simple assignment)
         self.config = config or {}
@@ -116,6 +189,60 @@ class AI2ThorEnvWrapper(BaseEnv):
             self.controller_platform = CloudRendering
         else:
             self.controller_platform = platform_setting
+
+        # GPU device index for CloudRendering (maps to Vulkan device via cuda-vulkan-mapping.json)
+        self.gpu_device = env_config.get("gpu_device", None)
+        # Direct Vulkan index for CPU-only renderers such as Mesa lavapipe. Unlike
+        # gpu_device, this does not require nvidia-smi or CUDA/Vulkan UUID mapping.
+        self.force_vulkan_device_index = env_config.get("force_vulkan_device_index")
+
+        # AI2-THOR Unity build lookup: Controller() checks build availability against
+        # s3-us-west-2.amazonaws.com; on machines without access to that CDN it fails with
+        # "Invalid commit_id: ... no build exists for arch=Linux platforms=...".
+        # local_executable_path points directly at an already-downloaded build (skips the
+        # remote lookup entirely); commit_id lets you pin a specific, known-reachable build.
+        self.local_executable_path = env_config.get(
+            "local_executable_path", os.environ.get("AI2THOR_LOCAL_EXECUTABLE_PATH")
+        )
+        self.controller_commit_id = env_config.get(
+            "commit_id", os.environ.get("AI2THOR_COMMIT_ID")
+        )
+        # ------------------------------------------------------------------
+        # Absolute-path environment overrides: pin the AI2-THOR build cache, its
+        # Vulkan loader dependency, and the outbound network proxy to persistent
+        # absolute-path storage instead of $HOME (which can be wiped/rebuilt when
+        # the machine/container is reset, breaking uv venvs and ai2thor's cache).
+        # This lets any machine that can mount the same absolute-path storage
+        # (e.g. a shared network filesystem) reuse an already-downloaded Unity
+        # build and Vulkan libraries without re-downloading or re-installing.
+        #   - env.ai2thor_home / AI2THOR_HOME:
+        #       Redirects ai2thor's base_dir (hardcoded to "~/.ai2thor", resolved via
+        #       os.path.expanduser("~")) by overriding the process HOME env var, so
+        #       ~/.ai2thor (build cache) lands on persistent absolute-path storage.
+        #   - env.ai2thor_ld_library_path / AI2THOR_LD_LIBRARY_PATH:
+        #       Extends LD_LIBRARY_PATH so ai2thor.platform.CloudRendering.validate()'s
+        #       ctypes.util.find_library("vulkan") call can locate libvulkan.so.1
+        #       (fixes "CloudRendering requires libvulkan1") without needing root/apt-get.
+        #   - env.ai2thor_vk_icd_filenames / VK_ICD_FILENAMES:
+        #       Points at a Vulkan ICD (e.g. Mesa lavapipe software driver) as a
+        #       fallback when no vendor GPU Vulkan ICD (e.g. nvidia_icd.json) exists.
+        #   - env.http_proxy/https_proxy or standard HTTP_PROXY/HTTPS_PROXY:
+        #       Used to reach s3-us-west-2.amazonaws.com for Unity build downloads.
+        self.ai2thor_home = env_config.get("ai2thor_home", os.environ.get("AI2THOR_HOME"))
+        self.ai2thor_extra_ld_library_path = env_config.get(
+            "ai2thor_ld_library_path", os.environ.get("AI2THOR_LD_LIBRARY_PATH")
+        )
+        self.ai2thor_vk_icd_filenames = env_config.get(
+            "ai2thor_vk_icd_filenames", os.environ.get("AI2THOR_VK_ICD_FILENAMES")
+        )
+        self.ai2thor_http_proxy = env_config.get("http_proxy", os.environ.get("HTTP_PROXY", os.environ.get("http_proxy")))
+        self.ai2thor_https_proxy = env_config.get("https_proxy", os.environ.get("HTTPS_PROXY", os.environ.get("https_proxy")))
+        _log_ts("  [SUBSTAGE] _apply_ai2thor_env_overrides() starting")
+        self._apply_ai2thor_env_overrides()
+        _log_ts("  [SUBSTAGE] _apply_ai2thor_env_overrides() done")
+
+        # Server start timeout (seconds) - lavapipe/software rendering needs more time
+        self.server_start_timeout = float(env_config.get("server_start_timeout", 300.0))
 
         # Visibility distance configuration (affects obj["visible"] in metadata)
         # Default 1.0m (was 1.5m which is AI2-THOR's default visibilityDistance)
@@ -173,7 +300,9 @@ class AI2ThorEnvWrapper(BaseEnv):
         self.step_failure_penalty = reward_config.get("step_failure_penalty", -0.05)
 
         # Ensure output directory exists
+        _log_ts(f"  [SUBSTAGE] os.makedirs(output_dir={output_dir}) starting")
         os.makedirs(output_dir, exist_ok=True)
+        _log_ts("  [SUBSTAGE] os.makedirs(output_dir) done")
 
         # Initialize AI2-THOR controller
         print(f"Initializing AI2-THOR scene: {self.scene}")
@@ -198,16 +327,185 @@ class AI2ThorEnvWrapper(BaseEnv):
             )
             print(f"  • Using custom platform parameter: {platform_name}")
 
+        # gpu_device is only for NVIDIA CUDA-to-Vulkan mapping. CPU-only lavapipe
+        # must use force_vulkan_device_index instead because nvidia-smi is unavailable.
+        if self.gpu_device is not None:
+            controller_kwargs["gpu_device"] = self.gpu_device
+            print(f"  • Using gpu_device: {self.gpu_device}")
+        if self.force_vulkan_device_index is not None:
+            print(
+                "  • Forcing direct Vulkan device index: "
+                f"{self.force_vulkan_device_index} (no CUDA/NVIDIA mapping)"
+            )
+
+        # Set server start timeout (lavapipe rendering is slower)
+        controller_kwargs["server_start_timeout"] = self.server_start_timeout
+        print(f"  • Server start timeout: {self.server_start_timeout}s")
+
         if self.agent_count > 1:
             controller_kwargs["agentCount"] = self.agent_count
             print(f"  • Multi-agent embodied mode: agentCount={self.agent_count}")
 
+        # local_executable_path: point directly at an already-downloaded Unity build,
+        # bypassing find_build()'s requests.head(...s3-us-west-2.amazonaws.com...) check
+        if self.local_executable_path:
+            controller_kwargs["local_executable_path"] = self.local_executable_path
+            print(f"  • Using local_executable_path: {self.local_executable_path} (skips remote build lookup)")
+        elif self.controller_commit_id:
+            controller_kwargs["commit_id"] = self.controller_commit_id
+            print(f"  • Using explicit commit_id: {self.controller_commit_id}")
+
         # Debug output: Display FOV value
         print(f"  • Camera Field of View (FOV): {self.field_of_view}°")
 
-        self.controller = ai2thor.controller.Controller(**controller_kwargs)
+        _log_ts(
+            "🚀 [STAGE] Launching AI2-THOR Unity subprocess via ai2thor.controller.Controller(...) "
+            "— this is the step most likely to hang (Vulkan init / build download), "
+            f"server_start_timeout={self.server_start_timeout}s"
+        )
+        # Hard timeout watchdog around Controller() construction: ai2thor's own
+        # server_start_timeout only bounds the *read* phase in
+        # FifoServer._read_with_timeout(); it does NOT cover
+        # FifoServer._recv_message()'s `open(self.server_pipe_path, "rb")` call, which
+        # blocks *forever* (uninterruptible, no timeout) if the Unity subprocess never
+        # opens its end of the FIFO -- e.g. because it's stuck busy-waiting during
+        # Vulkan device init (common when force_vulkan_device_index isn't set on a
+        # CPU-only/lavapipe node and Unity tries to auto-select a GPU device instead).
+        # Without this, a single bad node/config silently occupies its whole task slot
+        # for the entire --task-timeout-seconds (e.g. 2h) producing zero information
+        # beyond "heartbeat: still running". Kill the runaway Unity process tree and
+        # fail fast instead, so the task-level timeout/retry logic gets a chance to
+        # actually retry on a different node instead of always burning the full budget.
+        _controller_hard_timeout = max(60.0, self.server_start_timeout + 120.0)
+        _controller_done = threading.Event()
+
+        def _kill_stuck_unity_watchdog():
+            if _controller_done.wait(_controller_hard_timeout):
+                return  # Controller() finished in time, nothing to do.
+            _log_ts(
+                f"❌ [WATCHDOG] Controller() did not return within {_controller_hard_timeout:.0f}s "
+                "(likely stuck in FifoServer._recv_message()'s open(fifo, 'rb') waiting for a Unity "
+                "subprocess that never completed its handshake -- see force_vulkan_device_index in "
+                "the YAML config). Killing Unity subprocess children first (best-effort log signal), "
+                "then hard-exiting this whole process: a blocking open(fifo, 'rb') on the main thread "
+                "is an uninterruptible syscall that killing the *child* alone will NOT unblock, so the "
+                "only reliable way to stop wasting the task-timeout budget is to exit here and let the "
+                "outer run_task_subprocess_streaming()/cluster scheduler retry on a fresh process."
+            )
+            try:
+                import signal
+
+                for pid in _list_descendant_pids(os.getpid()):
+                    try:
+                        with open(f"/proc/{pid}/comm", "r", encoding="utf-8", errors="ignore") as f:
+                            name = f.read().strip().lower()
+                    except OSError:
+                        continue
+                    if "thor" in name or "unity" in name:
+                        _log_ts(f"    [WATCHDOG] killing stuck child process pid={pid} name={name}")
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+            except Exception as watchdog_err:
+                _log_ts(f"    [WATCHDOG] failed to enumerate/kill child processes: {watchdog_err}")
+            finally:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                # os._exit (not sys.exit/raise): the main thread is stuck in an
+                # uninterruptible blocking syscall and will never see an exception; only
+                # an immediate process-wide exit actually frees the task slot. Exit code
+                # 88 is a distinct marker for "killed by the ai2thor Controller() stall
+                # watchdog" in case it's useful for the caller's retry/alerting logic.
+                os._exit(88)
+
+        _watchdog_thread = threading.Thread(
+            target=_kill_stuck_unity_watchdog, name="ai2thor-controller-watchdog", daemon=True
+        )
+        _watchdog_thread.start()
+        try:
+            if self.force_vulkan_device_index is None:
+                self.controller = ai2thor.controller.Controller(**controller_kwargs)
+            else:
+                self.controller = _ControllerWithForcedVulkanDevice(
+                    **controller_kwargs,
+                    force_vulkan_device_index=int(self.force_vulkan_device_index),
+                )
+            _log_ts("✓ [STAGE] AI2-THOR Controller constructed successfully (Unity subprocess is up)")
+        except ValueError as e:
+            # Raised by ai2thor.controller.Controller.find_build() when the commit_id's
+            # build cannot be found for the requested platform. This is almost always caused
+            # by the current machine being unable to reach s3-us-west-2.amazonaws.com (AWS S3),
+            # where ai2thor.build.Build.exists() does a `requests.head()` check.
+            if "no build exists" in str(e) or "Invalid commit_id" in str(e):
+                raise RuntimeError(
+                    "\n"
+                    "❌ AI2-THOR Unity build lookup failed: cannot find/download a Unity build matching "
+                    "the installed ai2thor package.\n"
+                    f"   Original error: {e}\n"
+                    "   Root cause: this error comes from ai2thor.controller.Controller.find_build(), which "
+                    "sends an HTTP HEAD request to\n"
+                    "   http://s3-us-west-2.amazonaws.com/ai2-thor-public/ (AWS S3 us-west-2) to check whether "
+                    "the build exists; if this machine/network\n"
+                    "   cannot reach that S3 endpoint (common on internal/offline machines without an egress "
+                    "proxy), exists() is always False and this error is raised.\n"
+                    "   Fixes (pick one):\n"
+                    "   1) On a machine that CAN reach AWS S3, run the same ai2thor version once so it "
+                    "auto-downloads the build into ~/.ai2thor/releases/,\n"
+                    "      then copy that build directory here and set env.local_executable_path in the config "
+                    "(or env var AI2THOR_LOCAL_EXECUTABLE_PATH)\n"
+                    "      to skip the network lookup entirely.\n"
+                    "   2) Configure an HTTP(S) proxy (HTTPS_PROXY/HTTP_PROXY) that can reach "
+                    "s3-us-west-2.amazonaws.com. Also consider setting env.ai2thor_home to a "
+                    "persistent absolute path\n"
+                    "      so the downloaded build cache doesn't break when $HOME changes.\n"
+                    "   3) Pin env.commit_id (or env var AI2THOR_COMMIT_ID) to a commit_id known to be "
+                    "reachable from this network.\n"
+                ) from e
+            raise
+        except Exception as e:
+            # ai2thor.controller.Controller.find_build() raises a plain Exception when a build
+            # was found but platform validation (platform.validate) fails. The most common case
+            # is CloudRendering missing the Vulkan Loader:
+            #   "Platform CloudRendering failed validation with the following errors: Vulkan API
+            #    driver missing. CloudRendering requires libvulkan1. Please install by running:
+            #    sudo apt-get -y install libvulkan1"
+            # This is unrelated to networking (the build was already found/validated) -- it's
+            # purely a missing libvulkan.so.1 on this machine, and many compute nodes don't have
+            # root access to run apt-get install.
+            if "Vulkan API driver missing" in str(e) or "libvulkan1" in str(e):
+                raise RuntimeError(
+                    "\n"
+                    "❌ AI2-THOR CloudRendering platform validation failed: this machine is missing the "
+                    "Vulkan Loader (libvulkan.so.1).\n"
+                    f"   Original error: {e}\n"
+                    "   Root cause: ai2thor.platform.CloudRendering.validate() uses "
+                    "ctypes.util.find_library('vulkan') to check for\n"
+                    "   libvulkan.so.1; many compute nodes don't have root access to run "
+                    "'sudo apt-get -y install libvulkan1'.\n"
+                    "   Fixes (no root required, pick one):\n"
+                    "   1) Set env.ai2thor_ld_library_path (or env var AI2THOR_LD_LIBRARY_PATH) to a "
+                    "directory containing libvulkan.so.1\n"
+                    "      (e.g. from `conda install -c conda-forge vulkan-loader`, or another "
+                    "conda/venv env's lib dir that already\n"
+                    "      runs ai2thor successfully) -- it will be merged into LD_LIBRARY_PATH.\n"
+                    "   2) If no vendor GPU Vulkan ICD (e.g. nvidia_icd.json) is available, fall back "
+                    "to conda-forge mesa software\n"
+                    "      rendering: `conda install -c conda-forge mesa`, add its lib dir to "
+                    "env.ai2thor_ld_library_path, and point\n"
+                    "      env.ai2thor_vk_icd_filenames (or AI2THOR_VK_ICD_FILENAMES) at its "
+                    "share/vulkan/icd.d/lvp_icd.x86_64.json.\n"
+                    "      Note: lavapipe software rendering is much slower than hardware GPU "
+                    "rendering; use only as a fallback.\n"
+                ) from e
+            raise
+        finally:
+            # Always signal the watchdog thread, whether Controller() succeeded, raised,
+            # or (via the watchdog itself) got its Unity subprocess killed out from under it.
+            _controller_done.set()
 
         # Initialize scene with visibility distance
+        _log_ts("🚀 [STAGE] Sending 'Initialize' step to AI2-THOR controller...")
         self.controller.step(
             action="Initialize",
             gridSize=self.grid_size,
@@ -217,6 +515,7 @@ class AI2ThorEnvWrapper(BaseEnv):
         print(
             f"✓ AI2-THOR environment initialization complete (visibilityDistance={self.visibility_distance}m)"
         )
+        _log_ts("✓ [STAGE] AI2ThorEnvWrapper.__init__ finished — environment is ready")
 
         # If task information exists in config, automatically build success_predicate
         if self.success_condition:
@@ -280,6 +579,91 @@ class AI2ThorEnvWrapper(BaseEnv):
         else:
             print(f"⚠️  Unsupported success_condition type: {condition_type}")
             return lambda obj: False
+
+    def _apply_ai2thor_env_overrides(self) -> None:
+        """Inject ai2thor_home / LD_LIBRARY_PATH / VK_ICD_FILENAMES / proxy into os.environ.
+
+        These variables are only read at ai2thor runtime (find_build/download/Controller
+        subprocess launch) via os.path.expanduser, ctypes.util.find_library, and the
+        requests library, so it's sufficient to set them right before constructing
+        Controller() -- there's no need to set them before `import ai2thor` runs.
+
+        Goal: pin everything related to the AI2-THOR/ProcTHOR runtime environment (Unity
+        build cache, Vulkan library, outbound proxy) to persistent absolute-path storage
+        instead of the volatile $HOME, so any machine that can mount the same absolute
+        path can reuse it directly without re-downloading or re-diagnosing driver issues.
+        """
+        if self.ai2thor_home:
+            _log_ts(f"    [SUBSTAGE] expanduser/makedirs for ai2thor_home={self.ai2thor_home} starting")
+            ai2thor_home = os.path.expanduser(self.ai2thor_home)
+            # Safety net: warn loudly if this resolves onto a known shared/network
+            # filesystem mount instead of local disk. ai2thor guards its Unity build
+            # cache with fcntl.lockf() (ai2thor/util/lock.py), which is NOT reliably
+            # safe across nodes/containers on network filesystems -- a process that
+            # gets SIGKILL'ed while holding the lock can leave it "stuck", causing
+            # every subsequent Controller() call anywhere on the cluster to hang
+            # forever inside self._build.lock_sh() (uninterruptible, no timeout).
+            # This is exactly the "stuck right after AI2ThorEnvWrapper.__init__
+            # starting, heartbeat forever, no further log lines" symptom. Common
+            # cause: env.ai2thor_home in a YAML config takes priority over the
+            # AI2THOR_HOME env var (see below) and silently reintroduces a shared
+            # path even after the launch script was fixed to export a local one.
+            _shared_fs_markers = ("/mnt/dolphinfs/", "/mnt/hdfs/", "/mnt/nfs/")
+            if any(marker in ai2thor_home for marker in _shared_fs_markers):
+                print(
+                    f"  ⚠️  WARNING: ai2thor_home ({ai2thor_home}) looks like a shared/network "
+                    "filesystem path, not local disk. ai2thor's fcntl.lockf()-based build cache "
+                    "lock is not reliably safe across nodes/containers on such filesystems and can "
+                    "deadlock the whole cluster (Controller() hanging forever in self._build.lock_sh()). "
+                    "Check for a stray env.ai2thor_home in the YAML config overriding the AI2THOR_HOME "
+                    "env var set by the launch script -- prefer a local disk path (e.g. /tmp/...) instead.",
+                    flush=True,
+                )
+            os.makedirs(ai2thor_home, exist_ok=True)
+            os.environ["HOME"] = ai2thor_home
+            _log_ts(f"    [SUBSTAGE] HOME redirected to {ai2thor_home} done")
+            print(f"  • AI2-THOR cache HOME redirected to: {ai2thor_home} (base_dir -> {ai2thor_home}/.ai2thor)")
+        if self.ai2thor_extra_ld_library_path:
+            existing = os.environ.get("LD_LIBRARY_PATH", "")
+            paths = [p for p in self.ai2thor_extra_ld_library_path.split(os.pathsep) if p]
+            merged = os.pathsep.join(paths + ([existing] if existing else []))
+            os.environ["LD_LIBRARY_PATH"] = merged
+            print(f"  • LD_LIBRARY_PATH extended with: {self.ai2thor_extra_ld_library_path} (for libvulkan.so lookup)")
+        if self.ai2thor_vk_icd_filenames:
+            os.environ["VK_ICD_FILENAMES"] = self.ai2thor_vk_icd_filenames
+            print(f"  • VK_ICD_FILENAMES set to: {self.ai2thor_vk_icd_filenames}")
+        if self.ai2thor_http_proxy:
+            os.environ["http_proxy"] = self.ai2thor_http_proxy
+            os.environ["HTTP_PROXY"] = self.ai2thor_http_proxy
+        if self.ai2thor_https_proxy:
+            os.environ["https_proxy"] = self.ai2thor_https_proxy
+            os.environ["HTTPS_PROXY"] = self.ai2thor_https_proxy
+        if self.ai2thor_http_proxy or self.ai2thor_https_proxy:
+            print(f"  • Proxy configured for build downloads: http={self.ai2thor_http_proxy}, https={self.ai2thor_https_proxy}")
+            # NOTE: http_proxy/https_proxy are process-wide env vars, so once set here they
+            # would also be picked up by unrelated HTTP clients later in the same process
+            # (e.g. requests/httpx/OpenAI SDK calls made by the VLM agent to the internal
+            # Meituan AIGC gateway at aigc.sankuai.com). That gateway is an internal service
+            # reachable directly and NOT behind this outbound proxy (which only exists to
+            # reach s3-us-west-2.amazonaws.com for Unity build downloads), so without a
+            # no_proxy exclusion those VLM API calls would be wrongly routed through the
+            # proxy and hang/fail if the proxy is down or doesn't allow internal traffic.
+            existing_no_proxy = os.environ.get("no_proxy", os.environ.get("NO_PROXY", ""))
+            internal_domains = [
+                "sankuai.com",
+                "meituan.com",
+                ".mt",
+                "localhost",
+                "127.0.0.1",
+            ]
+            merged_no_proxy = ",".join(
+                dict.fromkeys(
+                    [d for d in existing_no_proxy.split(",") if d] + internal_domains
+                )
+            )
+            os.environ["no_proxy"] = merged_no_proxy
+            os.environ["NO_PROXY"] = merged_no_proxy
+            print(f"  • no_proxy set to exclude internal Meituan domains from the proxy: {merged_no_proxy}")
 
     def configure_task(
         self,
@@ -367,7 +751,9 @@ class AI2ThorEnvWrapper(BaseEnv):
             )
 
         # Reset scene
+        _log_ts(f"🚀 [STAGE] controller.reset(scene={self.scene}) starting...")
         event = self.controller.reset(scene=self.scene)
+        _log_ts("✓ [STAGE] controller.reset finished")
 
         # Task description (interactable objects are now fixed in system prompt)
         self.task_description = task_description

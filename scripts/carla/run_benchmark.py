@@ -207,38 +207,51 @@ def read_task_ids_from_csv(csv_path: str, only_pending: bool = False) -> list:
     return task_ids
 
 
+def _collect_benchmark_dirs(output_path: Path) -> list[Path]:
+    """
+    Collect all benchmark dirs from output_path, including those nested
+    under batch_* subdirectories (created by reorganizing shard dirs by run batch).
+
+    Supports three layouts:
+    1. Flat:  <output>/benchmark_* / <task_id>/
+    2. Shard: <output>/benchmark_* / shard-XXX / <task_id>/
+    3. Batch: <output>/batch_*/benchmark_shard-* / <task_id>/
+    """
+    all_dirs = []
+
+    # Layout 1 & 2: top-level benchmark_* dirs
+    for d in output_path.glob("benchmark_*"):
+        if d.is_dir():
+            all_dirs.append(d)
+
+    # Layout 3: batch_*/benchmark_shard-* dirs
+    for batch_dir in sorted(output_path.glob("batch_*"), key=lambda x: x.name, reverse=True):
+        if not batch_dir.is_dir():
+            continue
+        for d in batch_dir.glob("benchmark_*"):
+            if d.is_dir():
+                all_dirs.append(d)
+
+    return all_dirs
+
+
 def find_completed_tasks(output_dir: str) -> set:
     """
             （       benchmark    log.json episode_*.json  ）
-    
+
     Args:
-        output_dir:      
-        
+        output_dir:
+
     Returns:
-              ID  
+              ID
     """
     completed = set()
     output_path = Path(output_dir)
-    
+
     if not output_path.exists():
         return completed
-    
-    #     benchmark  （    ），      ，     
-    benchmark_dirs = sorted(
-        [d for d in output_path.glob("benchmark_*") if d.is_dir()],
-        key=lambda x: x.name,
-        reverse=True
-    )
-    
-    #            
-    sequential_dirs = sorted(
-        [d for d in output_path.glob("benchmark_sequential_*") if d.is_dir()],
-        key=lambda x: x.name,
-        reverse=True
-    )
-    
-    #       ，       
-    all_dirs = benchmark_dirs + sequential_dirs
+
+    all_dirs = _collect_benchmark_dirs(output_path)
     
     for benchmark_dir in all_dirs:
         #        worker  

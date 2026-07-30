@@ -1,0 +1,62 @@
+[base]
+type = ml-easy-job
+
+[resource]
+usergroup = hadoop-camera3d
+queue = root.zw05_training_cluster.hadoop-mmuc.cpu
+
+[dataset]
+dataset_name =
+dataset_type =
+dataset_path =
+
+[job_track]
+demand_id = 91369190
+upstream_jobid =
+input_dir =
+output_dir =
+log_dir =
+
+[user_args]
+
+[roles]
+workers = 16
+worker.memory = 100000
+worker.vcore = 16
+worker.script = RERUN_ALL=1 LLM_HISTORY_FEEDBACK=1 SAVE_NAME=ai2thor-memory_llm_history bash launch_dual_benchmark.sh ai2thor
+worker.ports = 1
+
+[am]
+afo.app.am.resource.mb = 4096
+
+[tensorboard]
+with.tensor.board = false
+
+[docker]
+afo.docker.image.name = registry-offlinebiz.sankuai.com/custom_prod/com.sankuai.data.hadoop.gpu/camera3d/training_cuda12.4-nccl2.21.5-glibc2.28-prod-spatialworld_26502192:1.0.0
+
+[data]
+afo.data.prefetch = false
+
+[failover]
+afo.app.support.engine.failover = true
+
+[conda]
+afo.conda.env.name =
+afo.conda.env.path =
+afo.conda.store.type =
+
+[distribute]
+afo.role.worker.gpu_driver_version = 470.103.01
+
+[others]
+afo.app.env.YARN_CONTAINER_RUNTIME_DOCKER_SHM_SIZE_BYTES = 640000000000
+afo.xm.notice.receivers.account = zhangshengjun02
+with_requirements = false
+afo.app.yarn.allocate.timeout.seconds = 3600000
+afo.app.blacklist.fail_times = 16
+afo.role.worker.task.attempt.max.retry = 1
+afo.dolphinfs.otherusers = hadoop-videogen-hl,hadoop-imagen-hl:true,hadoop-vision-data:true,hadoop-videogen-hlsc
+afo.use.hdfs.fuse=true
+afo.use.hdfs.fuse.subpath=:/mnt/hdfs
+afo.use.hdfs.fuse.readonly=false

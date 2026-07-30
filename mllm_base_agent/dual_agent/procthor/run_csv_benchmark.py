@@ -194,6 +194,12 @@ def main():
     parser.add_argument("--collaboration-mode", type=str, default="alternating", choices=["alternating", "sequential"], help="Collaboration mode")
     parser.add_argument("--agent1", type=str, default=None, help="Agent 1 single-agent config path")
     parser.add_argument("--agent2", type=str, default=None, help="Agent 2 single-agent config path")
+    parser.add_argument("--history-feedback", action="store_true", help="Inject each step's action + result into per-step history")
+    parser.add_argument("--llm-history-feedback", action="store_true", help="Use a second LLM to annotate recent action/outcome history")
+    parser.add_argument("--image-scale", type=float, default=1.0, help="Downscale factor for images sent to the VLM (0 < scale <= 1.0)")
+    parser.add_argument("--image-recent-steps", type=int, default=0, help="Number of recent history steps kept at original resolution")
+    parser.add_argument("--partner-view", action="store_true", help="Inject the partner body's current first-person image at each step")
+    parser.add_argument("--partner-view-scale", type=float, default=None, help="Downscale factor for the partner-view image (defaults to --image-scale)")
     args = parser.parse_args()
 
     csv_path = Path(args.csv)
@@ -298,6 +304,18 @@ def main():
             cmd.append("--headless")
         if args.max_steps:
             cmd.extend(["--max-steps", str(args.max_steps)])
+        if args.history_feedback:
+            cmd.append("--history-feedback")
+        if args.llm_history_feedback:
+            cmd.append("--llm-history-feedback")
+        if args.image_scale and args.image_scale < 1.0:
+            cmd.extend(["--image-scale", str(args.image_scale)])
+        if args.image_recent_steps and args.image_recent_steps > 0:
+            cmd.extend(["--image-recent-steps", str(args.image_recent_steps)])
+        if args.partner_view:
+            cmd.append("--partner-view")
+        if args.partner_view_scale is not None:
+            cmd.extend(["--partner-view-scale", str(args.partner_view_scale)])
 
         try:
             execution_start_time = time.time()
@@ -439,7 +457,9 @@ def main():
     print(f"Summary log: {summary_log_path}")
     print(f"CSV status: true={csv_stats['true']} false={csv_stats['false']} null={csv_stats['null']}")
     print(f"{'=' * 80}\n")
-    sys.exit(0 if (failed_model + failed_external) == 0 else 1)
+    # 任务失败（模型未达成目标）是 benchmark 的正常结果，不应导致非零退出；
+    # 只有 failed_external（环境崩溃/API 错误等真正的异常）才需要非零退出码。
+    sys.exit(0 if failed_external == 0 else 1)
 
 
 if __name__ == "__main__":

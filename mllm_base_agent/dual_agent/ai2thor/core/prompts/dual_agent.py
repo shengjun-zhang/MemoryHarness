@@ -420,6 +420,8 @@ Your goal is to complete tasks like a human through visual observation and step-
 **Partner's Actions:**
 {partner_trajectory}
 
+{memory_index_block}
+
 **Available Actions List:**
 
 1. **Navigation Actions** — support step granularity (Large / Medium / Small):
@@ -524,6 +526,7 @@ Your goal is to complete tasks like a human through visual observation and step-
 
 7. **Special Actions:**
    - Pass(): Skip your turn and let your partner act. Use when waiting for partner to complete something.
+   - ReadMemory(<file_name>): Look up an entry from the Memory Library (see above/below). This does NOT consume your step budget and does NOT act on the environment — use it whenever you are unsure how to recover from an error, before your first action, or before outputting DONE. Example: ReadMemory(feedback_blocking_agents.md).
 
 **CRITICAL RULES FOR DONE:**
 - NEVER trust your partner's message alone - you must VERIFY completion yourself!
@@ -531,6 +534,7 @@ Your goal is to complete tasks like a human through visual observation and step-
 - If an action failed (you got an error message), the task is NOT complete
 - Only use DONE when you can SEE that all objectives are met in your current view
 - If unsure whether task is complete, keep working instead of saying DONE
+- Before your FIRST DONE attempt this episode, consider `ReadMemory(feedback_done_verification.md)` — DONE is rejected by a real evaluator, not a self-report, and this note lists the most common reasons it fails
 
 **Collaboration Strategy:**
 0. **Initial Orientation** (First Few Steps): When starting a task, take time to look around and survey your environment by rotating and observing. This helps you understand the layout and avoid facing walls. **TELL YOUR PARTNER** what you discover!
@@ -549,7 +553,7 @@ Verification: Have I verified that ALL objectives are actually complete?
 Next Action: My immediate action plan.
 </THINK>
 <ACTION>
-ActionName or ActionName(ObjectType) or FillObjectWithLiquid(ObjectType, LiquidType) or ThrowObject or Pass() or DONE or FAIL
+ActionName or ActionName(ObjectType) or FillObjectWithLiquid(ObjectType, LiquidType) or ThrowObject or Pass() or ReadMemory(<file_name>) or DONE or FAIL
 </ACTION>
 <COMMUNICATE>
 [Optional but recommended: Coordinate with your partner]
@@ -590,6 +594,21 @@ DONE
 Task complete! I verified: Book is open, DeskLamp is off.
 </COMMUNICATE>
 
+**Example - Consulting Memory After a Repeated Error:**
+<THINK>
+Current Situation: My PickupObject(Egg) failed twice in a row with "Agent 1 is blocking Agent 0". I don't want to keep repeating the same blocked move.
+Task Analysis: I need to get around my partner's body rather than push through it.
+Coordination: Let me check the memory library for the documented recovery pattern before wasting another step.
+Verification: Not complete.
+Next Action: Look up the blocking-recovery pattern; this costs no step budget.
+</THINK>
+<ACTION>
+ReadMemory(feedback_blocking_agents.md)
+</ACTION>
+<COMMUNICATE>
+I'm blocked by you near the counter — checking my notes for the best way around, one sec.
+</COMMUNICATE>
+
 **CRITICAL - REALISTIC COLLABORATION MODE:**
 - **You can ONLY know about your partner through their MESSAGES**
 - You do NOT automatically see what your partner does or discovers
@@ -610,6 +629,7 @@ Task complete! I verified: Book is open, DeskLamp is off.
 - Focus on efficiency - divide and conquer when possible
 - If an action fails, tell your partner and try a different approach
 - NEVER claim DONE based solely on partner's message - VERIFY yourself!
+- **Use the Memory Library**: `ReadMemory(<file_name>)` costs no step budget. Scan the memory index above; when you hit a repeated error, are about to claim DONE, or aren't sure how to proceed, read the matching entry rather than guessing blindly.
 """
 
 

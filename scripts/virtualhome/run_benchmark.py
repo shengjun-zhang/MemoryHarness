@@ -148,6 +148,40 @@ def read_task_ids_from_csv(csv_path: str, only_null: bool = True) -> list:
     return task_ids
 
 
+def _collect_benchmark_dirs(output_path: Path, save_name: Optional[str] = None) -> list[Path]:
+    """
+    Collect all benchmark dirs from output_path, including those nested
+    under batch_* subdirectories (created by reorganizing shard dirs by run batch).
+
+    Supports three layouts:
+    1. Flat:  <output>/benchmark_* / <task_id>/
+    2. Shard: <output>/benchmark_* / shard-XXX / <task_id>/
+    3. Batch: <output>/batch_*/benchmark_shard-* / <task_id>/
+    """
+    all_dirs = []
+
+    # Layout 1 & 2: top-level benchmark_* dirs
+    for d in output_path.glob("benchmark_*"):
+        if d.is_dir():
+            all_dirs.append(d)
+
+    # Layout 3: batch_*/benchmark_shard-* dirs
+    for batch_dir in sorted(output_path.glob("batch_*"), key=lambda x: x.name, reverse=True):
+        if not batch_dir.is_dir():
+            continue
+        for d in batch_dir.glob("benchmark_*"):
+            if d.is_dir():
+                all_dirs.append(d)
+
+    # Custom save_name dirs (top-level only)
+    if save_name:
+        for d in output_path.glob(f"{save_name}_*"):
+            if d.is_dir():
+                all_dirs.append(d)
+
+    return all_dirs
+
+
 def find_completed_tasks(output_dir: str, save_name: Optional[str] = None) -> set:
     """
     Find completed tasks (log.json or episode_*.json in latest benchmark dirs).
@@ -165,24 +199,7 @@ def find_completed_tasks(output_dir: str, save_name: Optional[str] = None) -> se
     if not output_path.exists():
         return completed
 
-    benchmark_dirs = sorted(
-        [d for d in output_path.glob("benchmark_*") if d.is_dir()],
-        key=lambda x: x.name,
-        reverse=True
-    )
-    sequential_dirs = sorted(
-        [d for d in output_path.glob("benchmark_sequential_*") if d.is_dir()],
-        key=lambda x: x.name,
-        reverse=True
-    )
-    custom_dirs = []
-    if save_name:
-        custom_dirs = sorted(
-            [d for d in output_path.glob(f"{save_name}_*") if d.is_dir()],
-            key=lambda x: x.name,
-            reverse=True
-        )
-    all_dirs = benchmark_dirs + sequential_dirs + custom_dirs
+    all_dirs = _collect_benchmark_dirs(output_path, save_name)
 
     for benchmark_dir in all_dirs:
         for worker_dir in benchmark_dir.glob("worker_*"):
@@ -2021,7 +2038,10 @@ Examples:
         
         print(f"{'=' * 80}\n")
         
-        sys.exit(0 if (failed_model + failed_external) == 0 else 1)
+        # 任务失败（模型未达成目标）是 benchmark 的正常结果，不应导致非零退出；
+        # 只有 failed_external（环境崩溃/API 错误等真正的异常）才需要非零退出码，
+        # 以便集群调度（如 AFO/HOPE）据此判断是否需要 failover/重试。
+        sys.exit(0 if failed_external == 0 else 1)
     except _SkipSequential:
         pass
     finally:
@@ -2392,7 +2412,9 @@ Examples:
         print("\n⚠️ User interrupt")
         exit_code = 1
     else:
-        exit_code = 0 if (failed_model + failed_external) == 0 else 1
+        # 任务失败（模型未达成目标）是 benchmark 的正常结果，不应导致非零退出；
+        # 只有 failed_external（环境崩溃/API 错误等真正的异常）才需要非零退出码。
+        exit_code = 0 if failed_external == 0 else 1
     
     summary_log_path = task_logs_dir / f"summary_{timestamp}.log"
     total_duration = sum(record['duration'] for record in task_records)

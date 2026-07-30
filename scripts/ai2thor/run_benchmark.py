@@ -52,6 +52,13 @@ from typing import Optional, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from mllm_base_agent.task_sharding import resolve_shard_config, shard_tasks
+from mllm_base_agent.subprocess_streaming import run_task_subprocess_streaming
+
 try:
     from tqdm import tqdm
     HAS_TQDM = True
@@ -65,6 +72,18 @@ EVAL_LOCK = Lock()
 INFLIGHT_TASKS_LOCK = Lock()
 INFLIGHT_TASKS = set()
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_benchmark_timestamp() -> str:
+    """
+              ：            BENCHMARK_RUN_TIMESTAMP（  YYYYMMDD_HHMMSS），
+        ，          shard              exp_name_time      （  dual_agent  ）；
+             （      ）           。
+    """
+    env_ts = os.environ.get("BENCHMARK_RUN_TIMESTAMP", "").strip()
+    if env_ts and re.fullmatch(r"\d{8}_\d{6}", env_ts):
+        return env_ts
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def _resolve_task_json(task_id: str) -> Path | None:
@@ -127,6 +146,85 @@ def read_task_ids_from_csv(csv_path: str, only_null: bool = True) -> list:
     return task_ids
 
 
+def _scan_task_dirs_for_completed(scan_root: Path, completed: set) -> None:
+    """      scan_root         task    ，       completed    。"""
+    for worker_dir in scan_root.glob("worker_*"):
+        if worker_dir.is_dir():
+            for task_dir in worker_dir.iterdir():
+                if task_dir.is_dir():
+                    task_id = task_dir.name
+                    has_log = (task_dir / "log.json").exists()
+                    has_episode = bool(list(task_dir.glob("episode_*.json")))
+
+                    if has_log or has_episode:
+                        completed.add(task_id)
+                    else:
+                        for run_dir in task_dir.glob("run_*"):
+                            if run_dir.is_dir():
+                                task_subdir = run_dir / task_id
+                                if task_subdir.exists():
+                                    if (task_subdir / "log.json").exists() or list(task_subdir.glob("episode_*.json")):
+                                        completed.add(task_id)
+                                        break
+                                if (run_dir / "log.json").exists() or list(run_dir.glob("episode_*.json")):
+                                    completed.add(task_id)
+                                    break
+
+    for task_dir in scan_root.iterdir():
+        if task_dir.is_dir() and not task_dir.name.startswith("worker_"):
+            task_id = task_dir.name
+            log_file = task_dir / "log.json"
+            episode_files = list(task_dir.glob("episode_*.json"))
+
+            for run_dir in task_dir.glob("run_*"):
+                if run_dir.is_dir():
+                    task_subdir = run_dir / task_id
+                    if task_subdir.exists():
+                        if (task_subdir / "log.json").exists() or list(task_subdir.glob("episode_*.json")):
+                            completed.add(task_id)
+                            break
+                    if (run_dir / "log.json").exists() or list(run_dir.glob("episode_*.json")):
+                        completed.add(task_id)
+                        break
+
+            if log_file.exists() or episode_files:
+                completed.add(task_id)
+
+
+def _collect_benchmark_dirs(output_path: Path, save_name: Optional[str] = None) -> list[Path]:
+    """
+    Collect all benchmark dirs from output_path, including those nested
+    under batch_* subdirectories (created by reorganizing shard dirs by run batch).
+
+    Supports three layouts:
+    1. Flat:  <output>/benchmark_* / <task_id>/
+    2. Shard: <output>/benchmark_* / shard-XXX / <task_id>/
+    3. Batch: <output>/batch_*/benchmark_shard-* / <task_id>/
+    """
+    all_dirs = []
+
+    # Layout 1 & 2: top-level benchmark_* dirs
+    for d in output_path.glob("benchmark_*"):
+        if d.is_dir():
+            all_dirs.append(d)
+
+    # Layout 3: batch_*/benchmark_shard-* dirs
+    for batch_dir in sorted(output_path.glob("batch_*"), key=lambda x: x.name, reverse=True):
+        if not batch_dir.is_dir():
+            continue
+        for d in batch_dir.glob("benchmark_*"):
+            if d.is_dir():
+                all_dirs.append(d)
+
+    # Custom save_name dirs (top-level only)
+    if save_name:
+        for d in output_path.glob(f"{save_name}_*"):
+            if d.is_dir():
+                all_dirs.append(d)
+
+    return all_dirs
+
+
 def find_completed_tasks(output_dir: str, save_name: Optional[str] = None) -> set:
     """
     Find completed tasks (log.json or episode_*.json in latest benchmark dirs).
@@ -137,6 +235,10 @@ def find_completed_tasks(output_dir: str, save_name: Optional[str] = None) -> se
 
     Returns:
         Set of completed task IDs.
+
+    NOTE:          （ dual_agent   ）：<prefix>_<timestamp>/shard-XXX/<task_id>/，
+       shard-XXX      ，              legacy   
+    <prefix>_shard-XXX-of-YYY_<timestamp>/<task_id>/           。
     """
     completed = set()
     output_path = Path(output_dir)
@@ -144,68 +246,17 @@ def find_completed_tasks(output_dir: str, save_name: Optional[str] = None) -> se
     if not output_path.exists():
         return completed
 
-    benchmark_dirs = sorted(
-        [d for d in output_path.glob("benchmark_*") if d.is_dir()],
-        key=lambda x: x.name,
-        reverse=True
-    )
-    sequential_dirs = sorted(
-        [d for d in output_path.glob("benchmark_sequential_*") if d.is_dir()],
-        key=lambda x: x.name,
-        reverse=True
-    )
-    custom_dirs = []
-    if save_name:
-        custom_dirs = sorted(
-            [d for d in output_path.glob(f"{save_name}_*") if d.is_dir()],
-            key=lambda x: x.name,
-            reverse=True
-        )
-    all_dirs = benchmark_dirs + sequential_dirs + custom_dirs
+    all_dirs = _collect_benchmark_dirs(output_path, save_name)
 
     for benchmark_dir in all_dirs:
-        for worker_dir in benchmark_dir.glob("worker_*"):
-            if worker_dir.is_dir():
-                for task_dir in worker_dir.iterdir():
-                    if task_dir.is_dir():
-                        task_id = task_dir.name
-                        has_log = (task_dir / "log.json").exists()
-                        has_episode = bool(list(task_dir.glob("episode_*.json")))
-                        
-                        if has_log or has_episode:
-                            completed.add(task_id)
-                        else:
-                            for run_dir in task_dir.glob("run_*"):
-                                if run_dir.is_dir():
-                                    task_subdir = run_dir / task_id
-                                    if task_subdir.exists():
-                                        if (task_subdir / "log.json").exists() or list(task_subdir.glob("episode_*.json")):
-                                            completed.add(task_id)
-                                            break
-                                    if (run_dir / "log.json").exists() or list(run_dir.glob("episode_*.json")):
-                                        completed.add(task_id)
-                                        break
+        shard_dirs = sorted(
+            (d for d in benchmark_dir.glob("shard-*") if d.is_dir()),
+            key=lambda x: x.name,
+        )
+        scan_roots = shard_dirs if shard_dirs else [benchmark_dir]
+        for scan_root in scan_roots:
+            _scan_task_dirs_for_completed(scan_root, completed)
 
-        for task_dir in benchmark_dir.iterdir():
-            if task_dir.is_dir() and not task_dir.name.startswith("worker_"):
-                task_id = task_dir.name
-                log_file = task_dir / "log.json"
-                episode_files = list(task_dir.glob("episode_*.json"))
-                
-                for run_dir in task_dir.glob("run_*"):
-                    if run_dir.is_dir():
-                        task_subdir = run_dir / task_id
-                        if task_subdir.exists():
-                            if (task_subdir / "log.json").exists() or list(task_subdir.glob("episode_*.json")):
-                                completed.add(task_id)
-                                break
-                        if (run_dir / "log.json").exists() or list(run_dir.glob("episode_*.json")):
-                            completed.add(task_id)
-                            break
-                
-                if log_file.exists() or episode_files:
-                    completed.add(task_id)
-    
     return completed
 
 
@@ -1138,6 +1189,8 @@ Examples:
   python -m scripts.ai2thor.run_benchmark --csv "experiments/csv/ai2thor/Spatial-Annotation-ai2thor.csv" --sequential --config experiments/configs/ai2thor/config_close_gpt-5.yaml --headless
   python -m scripts.ai2thor.run_benchmark --csv "experiments/csv/ai2thor/Spatial-Annotation-ai2thor.csv" --sequential --config experiments/configs/ai2thor/config_close_gpt-5.yaml --skip-completed
   python -m scripts.ai2thor.run_benchmark --csv "experiments/csv/ai2thor/Spatial-Annotation-ai2thor.csv" --workers 1 --config experiments/configs/ai2thor/config_close_gpt-5.yaml --task ai2thor03017
+  # 重新运行所有任务（不做断点续跑/resume，强制重跑 CSV 中所有任务，包括已完成的）:
+  python -m scripts.ai2thor.run_benchmark --csv "experiments/csv/ai2thor/Spatial-Annotation-ai2thor.csv" --config experiments/configs/ai2thor/config_close_gpt-5.yaml --rerun-all
   #                 （CSV   config       ）:
   python -m scripts.ai2thor.run_benchmark --csv "experiments/csv/ai2thor/Spatial-Annotation-ai2thor-Gemini-2.5-pro.csv" --config experiments/configs/ai2thor/config_close_Gemini-2.5-pro.yaml --save-name Gemini-2.5-pro --workers 4
   python -m scripts.ai2thor.run_benchmark --csv "experiments/csv/ai2thor/Spatial-Annotation-ai2thor-Gemini-3-Pro-Preview.csv" --config "experiments/configs/ai2thor/config_close_Gemini-3-Pro-Preview.yaml" --save-name "Gemini 3-Pro-Preview" --workers 4
@@ -1191,6 +1244,57 @@ Examples:
         action="store_true",
         help="Headless mode (CloudRendering, no X11)"
     )
+
+    parser.add_argument(
+        "--image-scale",
+        type=float,
+        default=None,
+        help=(
+            "Downscale factor for HISTORY images sent to the VLM (0 < scale <= 1.0), "
+            "forwarded to run_task.py. e.g. --image-scale 0.5 resizes 800x600 -> 400x300 "
+            "before base64 encoding, shrinking the request body and avoiding HTTP 413 on "
+            "long multi-image episodes. The current-step observation is always "
+            "full-resolution. Default: not passed (uses config.image.scale, or 1.0)."
+        ),
+    )
+    parser.add_argument(
+        "--image-recent-steps",
+        type=int,
+        default=None,
+        help=(
+            "Number of most-recent history steps whose images are kept at original "
+            "resolution, forwarded to run_task.py. Only meaningful when --image-scale < "
+            "1.0. Default: not passed (uses config.image.recent_steps, or 0)."
+        ),
+    )
+
+    parser.add_argument(
+        "--decision-mode",
+        type=str,
+        default=None,
+        choices=["standard", "lookahead"],
+        help=(
+            "Per-step decision strategy, forwarded to run_task.py. 'standard' (default): the "
+            "model picks one action directly from the current observation. 'lookahead': every "
+            "candidate discrete action is tentatively executed and shown to the model before it "
+            "chooses which one to actually commit. Default: not passed (uses config.decision.mode, "
+            "or 'standard')."
+        ),
+    )
+    parser.add_argument(
+        "--history-window-size",
+        type=int,
+        default=None,
+        help=(
+            "Number of most-recent steps kept in the short-term multimodal history sent to the "
+            "VLM, forwarded to run_task.py (overrides config.context_management."
+            "short_term_history_window_size). Smaller values shrink the per-request payload "
+            "(fewer history images), which helps avoid HTTP 413 Request Entity Too Large on "
+            "long episodes, especially combined with --decision-mode lookahead. Default: not "
+            "passed (uses config.context_management.short_term_history_window_size, or the "
+            "built-in cap)."
+        ),
+    )
     
     parser.add_argument(
         "--sequential",
@@ -1203,7 +1307,17 @@ Examples:
         action="store_true",
         help="Skip already completed tasks (from latest benchmark dir)"
     )
-    
+
+    parser.add_argument(
+        "--rerun-all",
+        action="store_true",
+        help=(
+            "重新运行 CSV 中所有任务（包括已标记为 true/false 的任务），而不是断点续跑(resume)；"
+            "默认只运行 Completed 为空(null) 的任务。开启后会忽略 --skip-completed 的过滤，"
+            "即使已存在输出也会强制重跑"
+        ),
+    )
+
     parser.add_argument(
         "--outputs-completed-dir",
         type=str,
@@ -1224,9 +1338,39 @@ Examples:
         default=None,
         help="Run only this task ID (e.g. ai2thor03017). Otherwise run all null tasks in CSV"
     )
-    
+
+    parser.add_argument(
+        "--task-timeout-seconds",
+        type=int,
+        default=0,
+        help="单个任务超时秒数；0 表示不限制（集群排障建议设置，例如 7200）",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=None,
+        help="跨机器任务分片总数；默认从 TASK_NUM_SHARDS/WORLD_SIZE/AFO 集群信息读取",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help="当前机器的分片编号（从 0 开始）；默认从 TASK_SHARD_INDEX/RANK/AFO 集群信息读取",
+    )
+    parser.add_argument(
+        "--shard-strategy",
+        choices=["round_robin", "contiguous"],
+        default="round_robin",
+        help="任务分片策略：轮询分配（默认，较均衡）或连续区间",
+    )
+
     args = parser.parse_args()
-    
+
+    try:
+        shard_config = resolve_shard_config(args.num_shards, args.shard_index)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     csv_path = Path(args.csv)
     if not csv_path.exists():
         print(f"❌ CSV file not found: {csv_path}")
@@ -1242,17 +1386,28 @@ Examples:
         print(f"📋 Single-task mode: {task_ids[0]}")
     else:
         print(f"📋 Reading task IDs from CSV: {csv_path}")
-        task_ids = read_task_ids_from_csv(str(csv_path), only_null=True)
+        only_null = not args.rerun_all
+        task_ids = read_task_ids_from_csv(str(csv_path), only_null=only_null)
         if not task_ids:
-            print("✓ No task IDs with Completed=null — this CSV has nothing pending (exit 0, success).")
-            print("💡 All rows may already be true/false; reset Completed or use --task to re-run specific IDs.")
-            sys.exit(0)
-        print(f"✓ Found {len(task_ids)} tasks with Completed=null")
+            if only_null:
+                print("✓ No task IDs with Completed=null — this CSV has nothing pending (exit 0, success).")
+                print("💡 All rows may already be true/false; reset Completed or use --task to re-run specific IDs.")
+                sys.exit(0)
+            else:
+                print("❌ No task IDs found in CSV")
+                sys.exit(1)
+        if only_null:
+            print(f"✓ Found {len(task_ids)} tasks with Completed=null")
+        else:
+            print(f"✓ Found {len(task_ids)} tasks (rerun-all mode, including completed true/false)")
     print(f"  First 5: {task_ids[:5]}")
     if len(task_ids) > 5:
         print(f"  ... (total {len(task_ids)} tasks)")
-    
-    if args.skip_completed:
+
+    if args.rerun_all and args.skip_completed:
+        print("⚠️  --rerun-all 已启用，忽略 --skip-completed（强制重跑所有任务，不做断点续跑）")
+
+    if args.skip_completed and not args.rerun_all:
         print(f"\n🔍 Checking completed tasks (from latest benchmark dir)...")
         completed_tasks = find_completed_tasks(args.output_dir, args.save_name)
         
@@ -1287,9 +1442,31 @@ Examples:
         else:
             print(f"  Duplicates (first 10): {duplicate_task_ids[:10]} ...")
     task_ids = unique_task_ids
-    
+
+    unsharded_task_count = len(task_ids)
+    task_ids = shard_tasks(task_ids, shard_config, args.shard_strategy)
+    if shard_config.enabled:
+        print(
+            f"🔀 Task shard {shard_config.shard_index}/{shard_config.num_shards} "
+            f"({args.shard_strategy}, source={shard_config.source}): "
+            f"selected {len(task_ids)}/{unsharded_task_count} tasks"
+        )
+        # Isolate CSV writes per shard so concurrent workers never race on the
+        # same file; each shard gets its own copy under a dedicated dir, keyed
+        # by shard index. Downstream code below only ever reads/writes
+        # `csv_path`, so reassigning it here is sufficient (no other call site
+        # needs to change).
+        shard_csv_dir = Path(args.output_dir) / ".shard_csv"
+        shard_csv_dir.mkdir(parents=True, exist_ok=True)
+        sharded_csv_path = shard_csv_dir / (
+            f"{csv_path.stem}.shard-{shard_config.shard_index:03d}-of-{shard_config.num_shards:03d}{csv_path.suffix}"
+        )
+        shutil.copy2(csv_path, sharded_csv_path)
+        print(f"Shard CSV (isolated writes): {sharded_csv_path}")
+        csv_path = sharded_csv_path
+
     if not task_ids:
-        print("❌ No tasks to run")
+        print("✓ This shard has no tasks to run" if shard_config.enabled else "❌ No tasks to run")
         sys.exit(0)
     
     if args.sequential:
@@ -1324,9 +1501,16 @@ Examples:
             actual_config_path = Path(temp_config_file.name)
             print(f"✓ Temp config created: {actual_config_path}\n")
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = resolve_benchmark_timestamp()
         prefix = args.save_name if args.save_name else "benchmark_sequential"
-        benchmark_output_dir = os.path.join(args.output_dir, f"{prefix}_{timestamp}")
+        # dual_agent    ：      <prefix>_<timestamp>/  ，
+        #    shard    shard-XXX      ，       shard              。
+        experiment_output_dir = Path(args.output_dir) / f"{prefix}_{timestamp}"
+        if shard_config.enabled:
+            benchmark_output_dir = experiment_output_dir / f"shard-{shard_config.shard_index:03d}-of-{shard_config.num_shards:03d}"
+        else:
+            benchmark_output_dir = experiment_output_dir
+        benchmark_output_dir = str(benchmark_output_dir)
         os.makedirs(benchmark_output_dir, exist_ok=True)
         
         failed_logs_dir = os.path.join(benchmark_output_dir, "failed_logs")
@@ -1386,6 +1570,14 @@ Examples:
                 "--tasks", task_id,
                 "--output-dir", task_output_dir
             ]
+            if args.image_scale is not None:
+                cmd.extend(["--image-scale", str(args.image_scale)])
+            if args.image_recent_steps is not None:
+                cmd.extend(["--image-recent-steps", str(args.image_recent_steps)])
+            if args.decision_mode is not None:
+                cmd.extend(["--decision-mode", str(args.decision_mode)])
+            if args.history_window_size is not None:
+                cmd.extend(["--history-window-size", str(args.history_window_size)])
 
             normalized_task_id = normalize_task_id(task_id)
             with INFLIGHT_TASKS_LOCK:
@@ -1421,18 +1613,16 @@ Examples:
 
             try:
                 execution_start_time = time.time()
-                
-                result = subprocess.run(
-                    cmd,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=None
+
+                return_code, stdout_text, execution_duration = run_task_subprocess_streaming(
+                    cmd=cmd,
+                    cwd=Path(_PROJECT_ROOT),
+                    task_id=task_id,
+                    task_output_dir=Path(task_output_dir),
+                    timeout_seconds=args.task_timeout_seconds or None,
                 )
-                execution_duration = time.time() - execution_start_time
-                stdout_text = result.stdout or ""
-                stderr_text = result.stderr or ""
-                
+                stderr_text = ""
+
                 output_lines = []
                 if stdout_text:
                     output_lines.extend(stdout_text.splitlines())
@@ -1446,7 +1636,7 @@ Examples:
                     task_log_content.append("\n")
                 
                 task_log_content.append(f"=== Run info ===\n")
-                task_log_content.append(f"Exit code: {result.returncode}\n")
+                task_log_content.append(f"Exit code: {return_code}\n")
                 task_log_content.append(f"Duration: {execution_duration:.2f}s\n")
                 task_log_content.append(f"{'=' * 80}\n\n")
                 
@@ -1556,7 +1746,7 @@ Examples:
                         write_missing_result_diagnostic(
                             task_output_dir,
                             task_id,
-                            result.returncode,
+                            return_code,
                             stdout_text,
                             stderr_text,
                             error_text=failure_reason_detail,
@@ -1832,7 +2022,10 @@ Examples:
         
         print(f"{'=' * 80}\n")
         
-        sys.exit(0 if (failed_model + failed_external) == 0 else 1)
+        # 任务失败（模型未达成目标）是 benchmark 的正常结果，不应导致非零退出；
+        # 只有 failed_external（环境崩溃/API 错误等真正的异常）才需要非零退出码，
+        # 以便集群调度（如 AFO/HOPE）据此判断是否需要 failover/重试。
+        sys.exit(0 if failed_external == 0 else 1)
     
     actual_config_path = config_path
     temp_config_file = None
@@ -1856,10 +2049,17 @@ Examples:
         
         actual_config_path = Path(temp_config_file.name)
         print(f"✓ Temp config created: {actual_config_path}")
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    timestamp = resolve_benchmark_timestamp()
     prefix = args.save_name if args.save_name else "benchmark"
-    benchmark_output_dir = os.path.join(args.output_dir, f"{prefix}_{timestamp}")
+    # dual_agent    ：      <prefix>_<timestamp>/  ，
+    #    shard    shard-XXX      ，       shard              。
+    experiment_output_dir = Path(args.output_dir) / f"{prefix}_{timestamp}"
+    if shard_config.enabled:
+        benchmark_output_dir = experiment_output_dir / f"shard-{shard_config.shard_index:03d}-of-{shard_config.num_shards:03d}"
+    else:
+        benchmark_output_dir = experiment_output_dir
+    benchmark_output_dir = str(benchmark_output_dir)
     os.makedirs(benchmark_output_dir, exist_ok=True)
     task_logs_dir = Path(benchmark_output_dir) / "task_logs"
     task_logs_dir.mkdir(parents=True, exist_ok=True)
@@ -1928,19 +2128,25 @@ Examples:
             "--tasks", task_id,
             "--output-dir", task_output_dir
         ]
+        if args.image_scale is not None:
+            cmd.extend(["--image-scale", str(args.image_scale)])
+        if args.image_recent_steps is not None:
+            cmd.extend(["--image-recent-steps", str(args.image_recent_steps)])
+        if args.decision_mode is not None:
+            cmd.extend(["--decision-mode", str(args.decision_mode)])
+        if args.history_window_size is not None:
+            cmd.extend(["--history-window-size", str(args.history_window_size)])
         try:
             execution_start_time = time.time()
-            result = subprocess.run(
-                cmd,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=None
+            return_code, stdout_text, execution_duration = run_task_subprocess_streaming(
+                cmd=cmd,
+                cwd=Path(_PROJECT_ROOT),
+                task_id=task_id,
+                task_output_dir=Path(task_output_dir),
+                timeout_seconds=args.task_timeout_seconds or None,
             )
-            execution_duration = time.time() - execution_start_time
-            stdout_text = result.stdout or ""
-            stderr_text = result.stderr or ""
-            
+            stderr_text = ""
+
             if stdout_text:
                 task_log_content.append(f"=== STDOUT ===\n")
                 task_log_content.append(stdout_text)
@@ -1951,7 +2157,7 @@ Examples:
                 task_log_content.append("\n")
             
             task_log_content.append(f"=== Run info ===\n")
-            task_log_content.append(f"Exit code: {result.returncode}\n")
+            task_log_content.append(f"Exit code: {return_code}\n")
             task_log_content.append(f"Duration: {execution_duration:.2f}s\n")
             task_log_content.append(f"{'=' * 80}\n\n")
             
@@ -2109,7 +2315,7 @@ Examples:
                     write_missing_result_diagnostic(
                         task_output_dir,
                         task_id,
-                        result.returncode,
+                        return_code,
                         stdout_text,
                         stderr_text,
                         error_text=failure_reason_detail,
@@ -2277,7 +2483,9 @@ Examples:
         print("\n⚠️ User interrupt")
         exit_code = 1
     else:
-        exit_code = 0 if (failed_model + failed_external) == 0 else 1
+        # 任务失败（模型未达成目标）是 benchmark 的正常结果，不应导致非零退出；
+        # 只有 failed_external（环境崩溃/API 错误等真正的异常）才需要非零退出码。
+        exit_code = 0 if failed_external == 0 else 1
     
     summary_log_path = task_logs_dir / f"summary_{timestamp}.log"
     total_duration = sum(record['duration'] for record in task_records)
