@@ -71,11 +71,15 @@ def _normalize_usage_dict(result: Dict[str, Any]) -> Dict[str, int]:
     return {k: v for k, v in normalized.items() if v}
 
 
-def _extract_content(result: Dict[str, Any]) -> str:
+def _extract_message(result: Dict[str, Any]) -> Dict[str, Any]:
     choices = result.get("choices") or []
     if not choices:
         raise ValueError(f"Unexpected API response without choices: {result}")
-    message = choices[0].get("message") or {}
+    return choices[0].get("message") or {}
+
+
+def _extract_content(result: Dict[str, Any]) -> str:
+    message = _extract_message(result)
     content = message.get("content", "")
     if isinstance(content, dict):
         return str(content.get("text", content))
@@ -88,6 +92,35 @@ def _extract_content(result: Dict[str, Any]) -> str:
                 parts.append(str(item))
         return "\n".join(p for p in parts if p)
     return str(content or "")
+
+
+def _extract_tool_calls(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract OpenAI-shaped ``tool_calls`` from a chat completion response.
+
+    Returns ``[]`` when the model responded with plain text (no tool calls
+    requested), which is the default/legacy behavior for callers that never
+    pass ``tools`` in the first place.
+    """
+    message = _extract_message(result)
+    tool_calls = message.get("tool_calls") or []
+    normalized: List[Dict[str, Any]] = []
+    for call in tool_calls:
+        if hasattr(call, "model_dump"):
+            call = call.model_dump()
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") or {}
+        if hasattr(function, "model_dump"):
+            function = function.model_dump()
+        normalized.append({
+            "id": call.get("id", ""),
+            "type": call.get("type", "function"),
+            "function": {
+                "name": (function or {}).get("name", ""),
+                "arguments": (function or {}).get("arguments", "{}"),
+            },
+        })
+    return normalized
 
 
 class OpenAICompatibleChatModel:
@@ -118,6 +151,10 @@ class OpenAICompatibleChatModel:
         self.client_max_retries = client_max_retries
         self.model_kwargs = model_kwargs or {}
         self._client = None
+        # Set via bind_tools(); when non-empty, invoke() automatically attaches
+        # them to every request unless the caller passes tools=... explicitly.
+        self._bound_tools: Optional[List[Dict[str, Any]]] = None
+        self._bound_tool_choice: Optional[Any] = None
 
     @property
     def chat_url(self) -> str:
@@ -149,7 +186,13 @@ class OpenAICompatibleChatModel:
         for choice in getattr(response, "choices", []) or []:
             msg = getattr(choice, "message", None)
             if msg is not None:
-                choices.append({"message": {"content": getattr(msg, "content", "")}})
+                message: Dict[str, Any] = {"content": getattr(msg, "content", "")}
+                tool_calls = getattr(msg, "tool_calls", None)
+                if tool_calls:
+                    message["tool_calls"] = [
+                        tc.model_dump() if hasattr(tc, "model_dump") else tc for tc in tool_calls
+                    ]
+                choices.append({"message": message})
         usage = getattr(response, "usage", None)
         if hasattr(usage, "model_dump"):
             usage = usage.model_dump()
@@ -203,6 +246,23 @@ class OpenAICompatibleChatModel:
                 time.sleep(delay)
         raise ValueError(f"API request failed after {max_retries} attempts: {last_error}")
 
+    def bind_tools(
+        self,
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: Optional[Any] = "auto",
+    ) -> "OpenAICompatibleChatModel":
+        """Attach an OpenAI-shaped ``tools`` spec (e.g. from ``Toolkit.get_tools_spec()``).
+
+        Every subsequent ``invoke()`` call automatically includes ``tools``/
+        ``tool_choice`` in the request unless the caller overrides them via
+        keyword arguments. Passing ``tools=None`` clears the binding. Mutates
+        and returns ``self`` so it can be used either as ``vlm.bind_tools(...)``
+        or ``vlm = vlm.bind_tools(...)``.
+        """
+        self._bound_tools = list(tools) if tools else None
+        self._bound_tool_choice = tool_choice if self._bound_tools else None
+        return self
+
     def invoke(self, messages: Sequence[Any], **kwargs: Any) -> ModelResponse:
         payload: Dict[str, Any] = {
             "model": self.model,
@@ -213,6 +273,9 @@ class OpenAICompatibleChatModel:
         }
         if self.top_p is not None:
             payload["top_p"] = self.top_p
+        if self._bound_tools:
+            payload["tools"] = self._bound_tools
+            payload["tool_choice"] = self._bound_tool_choice
         if self.model_kwargs:
             payload.update(self.model_kwargs)
         payload.update(kwargs)
@@ -223,7 +286,12 @@ class OpenAICompatibleChatModel:
             metadata["token_usage"] = usage
         if result.get("model"):
             metadata["model_name"] = result["model"]
-        return ModelResponse(content=_extract_content(result), response_metadata=metadata, usage_metadata=usage)
+        return ModelResponse(
+            content=_extract_content(result),
+            response_metadata=metadata,
+            usage_metadata=usage,
+            tool_calls=_extract_tool_calls(result),
+        )
 
 def get_vlm(
     provider: str = "openai",

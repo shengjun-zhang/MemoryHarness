@@ -9,6 +9,7 @@ from mllm_base_agent.llm.messages import (
     ModelResponse,
     SystemMessage,
     TextPart,
+    ToolMessage,
     UserMessage,
     coerce_message,
     to_openai_messages,
