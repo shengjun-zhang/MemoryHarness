@@ -22,3 +22,9 @@ experiments/game_min_steps/
 /maze3d_pro_openai_evaluation.py
 main/
 SpatialWorld_NeurIPS_2026 (1)/
+
+# Datasets (large, not suitable for git)
+data/procthor-10k/
+
+# Manual backup files (git itself provides version history)
+*.csv.backup
