@@ -29,6 +29,19 @@ class AgentState(TypedDict, total=False):
     executor_type: Optional[str]
     goal_image_path: Optional[str]
     run_output_dir: Optional[str]
+    # Decision mode: 'standard' (default, unchanged) or 'lookahead' (probe all
+    # candidate actions first, then choose based on all resulting observations).
+    # See mllm_base_agent/agent/runner.py::lookahead_think_node.
+    decision_mode: Optional[str]
+    thor_agent_id: Optional[int]
+    # Skill-memory library (mirrors the dual-agent MEMORY.md/feedback_*.md
+    # pattern, see mllm_base_agent/tools/memory.py::MemoryLibrary): a
+    # reviewed index plus leaf notes distilled from past benchmark runs. The
+    # index is embedded into the system prompt every turn; leaf notes are
+    # fetched on demand via the ReadMemory(<file_name>) pseudo-action, which
+    # think_node/lookahead_think_node intercept before it ever reaches the
+    # environment (see runner.py's "memory_lookup" handling).
+    memory_library: Any
 
 
 def get_recent_trajectory(state: AgentState, n: int = 3) -> str:

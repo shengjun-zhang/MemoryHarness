@@ -6,6 +6,8 @@ Design goals:
 - Reuse SpatialWorld single-agent provider / parser / environment stack.
 - Support one shared model or two per-agent models via --agent1 / --agent2.
 - Keep output artifacts compatible with benchmark usage (log.json + dual_episode_*.json).
+- Ported from ai2thor/main.py: history-feedback, llm-history-feedback,
+  partner-view and image-scaling helpers.
 """
 
 
@@ -19,10 +21,12 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 import time
 from copy import deepcopy
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,6 +41,7 @@ from configs.procthor.load_config import load_config
 from actions.parser import parse_action_string
 from mllm_base_agent.llm.provider import get_vlm
 from mllm_base_agent.environments.procthor.wrapper import ProcTHOREnvWrapper
+from mllm_base_agent.tools.memory import MemoryLibrary
 from evaluation.procthor.base import create_evaluator_from_config
 from scripts.evaluate_actions_procthor import load_init_actions_for_task
 
@@ -54,6 +59,292 @@ MODEL_HISTORY_TURNS = 29
 
 # Map logical agent id ("agent_1" / "agent_2") to AI2-THOR embodied agentId (0 / 1).
 AGENT_TO_THOR_ID = {"agent_1": 0, "agent_2": 1}
+
+
+# ---------------------------------------------------------------------------
+# LLM History Analyzer Agent
+# ---------------------------------------------------------------------------
+#
+# A second LLM agent (built from the SAME VLM as the actors) that *manages and
+# analyzes* the acting agent's recent action-outcome history.  When enabled via
+# ``--llm-history-feedback`` / ``dual_agent.llm_history_feedback``, the
+# analyzer's per-step annotation REPLACES the raw
+# "Your previous action: X / Result: FAILED - Y" text that ``history_feedback``
+# injects into each history entry — turning low-level action/error strings into
+# high-information, actionable guidance for the acting agent.
+#
+# IMPORTANT: this is a pure superset.  When the flag is OFF the existing
+# ``history_feedback`` behavior is unchanged.
+
+HISTORY_ANALYZER_SYSTEM_PROMPT = """You are the History Analysis Agent for an embodied ProcTHOR dual-agent task.
+You receive the task instruction and the acting agent's recent step sequence. Each step has the action it attempted and the environment result (SUCCESS or an error string).
+
+Your job: produce a concise, actionable per-step analysis that will REPLACE the raw "action + error" text fed back to the acting agent. For EACH step write ONE short sentence (<=30 words) that captures (1) what the step tried / achieved (or why it failed) and (2) the concrete takeaway for the next move.
+
+Grounding rules (follow strictly):
+- Distance + "not in view": if distance < 1.0m the object is CLOSE but off-screen -> takeaway is to ROTATE (RotateLeft/RotateRight) or LookUp/LookDown, NOT to move closer. If distance >= 1.0m, move closer (MoveAhead(Small/Medium/Large)) while keeping it in view.
+- "No valid positions to place object": the agent is too close / standing on the target surface -> step back (MoveBack / MoveBack(Large)) or use a different receptacle.
+- "already" clean/off/on/sliced/open/closed: that subgoal is ALREADY satisfied -> move on, do not repeat.
+- agent/object "is blocking": go around (MoveLeft / MoveRight) or step back; do not repeat the blocked move.
+- DONE rejected: success conditions NOT met -> the agent must personally perform a successful state-changing interaction; do not trust partner claims.
+- Success: note which objective was met so the agent does not redo it.
+
+Output format: STRICT JSON only — a JSON array of strings, one per input step, in the same order. No markdown, no commentary.
+
+Example:
+Input:
+1. PickupObject(Egg) | ERROR: Egg not in view, distance: 0.8m
+2. RotateRight | SUCCESS
+3. PickupObject(Egg) | SUCCESS
+Output:
+["Tried PickupObject(Egg) but Egg within 1.0m yet not in view -> rotate to frame it, do NOT move closer.", "Rotated view -> success; re-locate the Egg before interacting.", "Picked up Egg -> success; Egg in hand, advance to next objective."]
+"""
+
+
+class HistoryAnalyzerAgent:
+    """LLM-based history manager that turns raw action/error strings into
+    concise, actionable per-step annotations.
+
+    The analyzer is text-only (no images) so the extra API call per step stays
+    cheap.  ``analyze`` returns ``(annotations, response)`` where
+    ``annotations`` is a list aligned with the input history entries (entries
+    may be ``None`` when unavailable) or ``None`` on any failure so the caller
+    can fall back to the raw ``history_feedback`` text.  ``response`` is the raw
+    VLM response (for token accounting) or ``None``.
+    """
+
+    def __init__(self, vlm: Any):
+        self._vlm = vlm
+        # Bounded cache: signature -> annotations.  An episode produces at most
+        # ~2 * per_agent_max_steps distinct windows, so this stays small.
+        self._cache: Dict[Tuple, List[Optional[str]]] = {}
+
+    @staticmethod
+    def _signature(entries: List[dict]) -> Tuple:
+        return tuple(
+            (
+                int(e.get("step", 0) or 0),
+                str(e.get("action_string", "") or ""),
+                str(e.get("error_message", "") or ""),
+            )
+            for e in entries
+        )
+
+    @staticmethod
+    def _build_user_prompt(entries: List[dict], task_prompt: str) -> str:
+        lines = [f"Task: {task_prompt}", "", "Recent steps (oldest -> newest):"]
+        for i, e in enumerate(entries, 1):
+            action = str(e.get("action_string", "") or "(no action)")
+            err = e.get("error_message")
+            result = "SUCCESS" if not err else f"ERROR: {err}"
+            lines.append(f"{i}. {action} | {result}")
+        lines.append("")
+        lines.append(
+            "Return a JSON array of strings, one per step above, each <=30 words, "
+            "in the same order."
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_annotations(text: str, expected_len: int) -> Optional[List[Optional[str]]]:
+        if not text:
+            return None
+        stripped = text.strip()
+        # Strip markdown code fences if present.
+        if stripped.startswith("```"):
+            first_newline = stripped.find("\n")
+            if first_newline != -1:
+                stripped = stripped[first_newline + 1 :]
+            if stripped.rstrip().endswith("```"):
+                stripped = stripped.rstrip()[:-3]
+        # Isolate the first JSON array in the response.
+        start = stripped.find("[")
+        end = stripped.rfind("]")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        try:
+            data = json.loads(stripped[start : end + 1])
+        except Exception:
+            return None
+        if not isinstance(data, list):
+            return None
+        annotations: List[Optional[str]] = []
+        for item in data:
+            if isinstance(item, str):
+                annotations.append(item.strip() or None)
+            else:
+                annotations.append(str(item).strip() or None)
+        # Align with expected length: pad / truncate defensively.
+        if len(annotations) < expected_len:
+            annotations.extend([None] * (expected_len - len(annotations)))
+        elif len(annotations) > expected_len:
+            annotations = annotations[:expected_len]
+        return annotations
+
+    def analyze(
+        self, history_entries: List[dict], task_prompt: str
+    ) -> Tuple[Optional[List[Optional[str]]], Any]:
+        """Return ``(annotations, raw_response)`` aligned with ``history_entries``.
+
+        ``annotations`` is ``None`` when the analyzer could not produce a usable
+        result, so the caller can fall back to the raw history_feedback text.
+        """
+        if not history_entries:
+            return None, None
+
+        sig = self._signature(history_entries)
+        if sig in self._cache:
+            return self._cache[sig], None
+
+        from mllm_base_agent.llm.messages import HumanMessage, SystemMessage
+
+        messages = [
+            SystemMessage(content=HISTORY_ANALYZER_SYSTEM_PROMPT),
+            HumanMessage(content=self._build_user_prompt(history_entries, task_prompt)),
+        ]
+
+        try:
+            response = self._vlm.invoke(messages)
+        except Exception as exc:
+            print(f"⚠️  History analyzer VLM call failed: {exc}")
+            return None, None
+
+        text = response.content if hasattr(response, "content") else str(response)
+        annotations = self._parse_annotations(text, len(history_entries))
+        if annotations is None:
+            print(
+                f"⚠️  History analyzer produced unparseable output: {(text or '')[:200]}"
+            )
+            return None, response
+
+        self._cache[sig] = annotations
+        return annotations, response
+
+
+# ---------------------------------------------------------------------------
+# Token-usage accounting (kept compatible with benchmark log parsing)
+# ---------------------------------------------------------------------------
+
+def _normalize_token_usage(raw_usage: Optional[dict]) -> Dict[str, int]:
+    usage = raw_usage or {}
+
+    def to_int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    prompt_tokens = to_int(usage.get("prompt_tokens"))
+    completion_tokens = to_int(usage.get("completion_tokens"))
+    total_tokens = to_int(usage.get("total_tokens")) or prompt_tokens + completion_tokens
+    api_calls = to_int(usage.get("api_calls")) or (1 if total_tokens else 0)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "api_calls": api_calls,
+    }
+
+
+def _extract_token_usage_from_response(response: Any) -> Dict[str, int]:
+    if response is None:
+        return _normalize_token_usage({})
+    metadata = getattr(response, "response_metadata", None) or {}
+    if isinstance(metadata, dict) and metadata.get("token_usage"):
+        return _normalize_token_usage(metadata["token_usage"])
+    usage_metadata = getattr(response, "usage_metadata", None)
+    if isinstance(usage_metadata, dict):
+        return _normalize_token_usage(usage_metadata)
+    additional_kwargs = getattr(response, "additional_kwargs", None) or {}
+    if isinstance(additional_kwargs, dict):
+        return _normalize_token_usage(
+            additional_kwargs.get("token_usage") or additional_kwargs.get("usage")
+        )
+    return _normalize_token_usage({})
+
+
+def _accumulate_token_usage(state: dict, token_usage: Dict[str, int]) -> None:
+    if "token_usage" not in state or not isinstance(state.get("token_usage"), dict):
+        state["token_usage"] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "api_calls": 0,
+        }
+    usage = state["token_usage"]
+    normalized = _normalize_token_usage(token_usage)
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "api_calls"):
+        usage[key] = int(usage.get(key, 0) or 0) + normalized[key]
+
+
+# ---------------------------------------------------------------------------
+# Image helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_image_scale(config: dict) -> float:
+    """Return the image downscale factor from config (``image.scale``).
+
+    Defaults to ``1.0`` (no scaling). Values are clamped to ``(0, 1.0]``.
+    """
+    try:
+        scale = float(config.get("image", {}).get("scale", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+    if scale <= 0.0 or scale > 1.0:
+        return 1.0
+    return scale
+
+
+def _resolve_image_recent_steps(config: dict) -> int:
+    """Return the number of recent history steps kept at original resolution."""
+    try:
+        recent_steps = int(config.get("image", {}).get("recent_steps", 0))
+    except (TypeError, ValueError):
+        return 0
+    if recent_steps < 0:
+        return 0
+    return recent_steps
+
+
+def _read_image_as_data_url(image_path: str, scale: float = 1.0) -> str:
+    """Read an image file and return a ``data:image/...;base64,...`` URL.
+
+    When ``scale`` is a value in ``(0, 1)`` the image is downscaled by that
+    factor with PIL (LANCZOS) before base64-encoding. When ``scale`` is ``None``
+    or ``>= 1.0`` the original raw bytes are returned unchanged.
+    """
+    # Fast path: no scaling -> original raw bytes, zero behavior change.
+    if not scale or scale >= 1.0:
+        with open(image_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/png;base64,{image_data}"
+
+    # Downscale path: PIL resize -> PNG re-encode. Falls back to raw bytes on
+    # any failure (missing PIL, corrupt image, ...) so the episode never breaks.
+    try:
+        from PIL import Image
+    except ImportError:
+        with open(image_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/png;base64,{image_data}"
+
+    try:
+        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+        with Image.open(image_path) as img:
+            w, h = img.size
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            img = img.convert("RGB")
+            if (new_w, new_h) != (w, h):
+                img = img.resize((new_w, new_h), resample)
+            buf = BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            image_data = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return f"data:image/png;base64,{image_data}"
+    except Exception:
+        with open(image_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/png;base64,{image_data}"
 
 
 class APIRetryError(Exception):
@@ -208,6 +499,157 @@ def _extract_tag_block(text: str, tag: str) -> Optional[str]:
     return text[start:end]
 
 
+_READ_MEMORY_PATTERN = re.compile(r"^read\s*memory\s*\(\s*(.*?)\s*\)$", re.IGNORECASE)
+
+
+def _parse_read_memory_action(action_string: str) -> Optional[str]:
+    """Return the requested memory file name if ``action_string`` is a
+    ``ReadMemory(<file_name>)`` call, else ``None``.
+
+    Mirrors ``mllm_base_agent/dual_agent/ai2thor/main.py``: this is a
+    pseudo-action that never reaches :func:`actions.parser.parse_action_string`
+    or the ProcTHOR environment. It lets the agent consult the on-disk memory
+    library (see :mod:`mllm_base_agent.tools.memory`) through the same
+    lightweight text-action grammar it already uses for everything else.
+    """
+    match = _READ_MEMORY_PATTERN.match(action_string.strip())
+    if not match:
+        return None
+    file_name = match.group(1).strip().strip("'\"")
+    return file_name or "MEMORY.md"
+
+
+def _build_memory_nudge_text(current_agent: dict) -> Optional[str]:
+    """Return an escalating, situation-specific nudge towards ``ReadMemory``.
+
+    Mirrors ``mllm_base_agent/dual_agent/ai2thor/main.py::_build_memory_nudge_text``.
+    A generic one-line mention of the memory library in the system prompt is
+    easy for the model to skim past, especially once it is buried under a
+    long system prompt + image history. This produces a short, blunt
+    reminder appended to the *current* turn (i.e. right next to where the
+    model is about to decide its next action) whose urgency scales with
+    ``consecutive_failures`` and whether this agent has ever opened the
+    library at all this episode:
+
+    - 0 consecutive failures: no nudge (avoid nagging on every single step).
+    - 1 failure: a soft suggestion.
+    - 2 failures: a strong, explicit instruction to read memory before
+      retrying, naming the free-lookup guarantee to remove any "it costs a
+      step" hesitation.
+    - >=3 failures AND the agent has *never* used ReadMemory this episode:
+      the most insistent framing, calling out the zero-usage fact directly
+      -- this is the single strongest predictor that the agent is stuck in a
+      loop it does not know how to break out of on its own.
+
+    Returns ``None`` when no nudge should be shown this turn.
+    """
+    consecutive_failures = int(current_agent.get("consecutive_failures", 0) or 0)
+    memory_reads_used = int(current_agent.get("memory_reads_used", 0) or 0)
+
+    if consecutive_failures <= 0:
+        return None
+    if consecutive_failures == 1:
+        return (
+            "Tip: if you're not sure why that failed, `ReadMemory(<file_name>)` "
+            "is a free lookup (no step cost) into the lessons-learned library "
+            "indexed above."
+        )
+    if consecutive_failures >= 3 and memory_reads_used == 0:
+        return (
+            f"**STOP AND READ MEMORY.** You have failed {consecutive_failures} actions "
+            "in a row this episode and have not opened the memory library even "
+            "once. Repeating the same kind of action is very unlikely to start "
+            "working on its own. Before your next action, output "
+            "`ReadMemory(<file_name>)` for the entry in the index above that "
+            "matches this error (it costs zero step budget) -- do not attempt "
+            "another world-changing action until you have."
+        )
+    return (
+        f"You have failed {consecutive_failures} actions in a row. Before "
+        "retrying, output `ReadMemory(<file_name>)` for the matching entry in "
+        "the memory index above -- it is a free lookup and repeated failures "
+        "are exactly the situation it exists for."
+    )
+
+
+def _build_done_checklist_nudge_text(current_agent: dict) -> Optional[str]:
+    """Return a one-time reminder to re-read the DONE-verification memory entry.
+
+    Mirrors ``mllm_base_agent/dual_agent/ai2thor/main.py::_build_done_checklist_nudge_text``.
+    Fires exactly once per agent, the first time its remaining step budget
+    drops to (or below) 20% of ``max_steps``. This is the point in an
+    episode where a model is most tempted to claim ``DONE`` prematurely to
+    avoid running out of budget, and it is exactly the situation
+    ``feedback_done_verification.md`` (see the memory library) targets. A
+    single well-timed nudge here is cheap and does not spam every remaining
+    step (tracked via ``current_agent["done_checklist_nudged"]``).
+    """
+    if current_agent.get("done_checklist_nudged"):
+        return None
+    max_steps = int(current_agent.get("max_steps", 0) or 0)
+    step_count = int(current_agent.get("step_count", 0) or 0)
+    if max_steps <= 0:
+        return None
+    remaining_fraction = (max_steps - step_count) / max_steps
+    if remaining_fraction > 0.2:
+        return None
+    current_agent["done_checklist_nudged"] = True
+    return (
+        "**Budget check:** you are in the final ~20% of your step budget. "
+        "Before outputting DONE, run `ReadMemory(feedback_done_verification.md)` "
+        "(free lookup) and re-verify every subgoal yourself -- do not claim "
+        "DONE based on assumption or your partner's report alone."
+    )
+
+
+# Hard-gate threshold: mirrors
+# ``mllm_base_agent/dual_agent/ai2thor/main.py::FORCE_READ_MEMORY_FAILURE_THRESHOLD``.
+# Once an agent has this many consecutive action failures, its next
+# submitted action is REQUIRED to be ReadMemory(...) -- anything else is
+# rejected (re-prompted, not executed) up to
+# ``FORCE_READ_MEMORY_MAX_REJECTIONS`` times. Exists because softer text
+# nudges alone let models paraphrase the memory index's one-line summaries
+# in <THINK> without ever emitting a real ReadMemory(<file_name>) action.
+FORCE_READ_MEMORY_FAILURE_THRESHOLD = 2
+# Safety valve: if the model still refuses to call ReadMemory after this many
+# rejected attempts, stop forcing the issue and let normal failure-handling
+# run, rather than burning the whole iteration_cap on one stuck turn.
+FORCE_READ_MEMORY_MAX_REJECTIONS = 3
+
+
+def _should_force_read_memory(current_agent: dict) -> bool:
+    """Whether the current agent's NEXT action is required to be ``ReadMemory(...)``.
+
+    Mirrors ``mllm_base_agent/dual_agent/ai2thor/main.py::_should_force_read_memory``.
+    True once ``consecutive_failures`` has reached
+    ``FORCE_READ_MEMORY_FAILURE_THRESHOLD`` for the CURRENT failure streak AND
+    the agent has not yet consulted memory during this same streak (tracked
+    via ``memory_consulted_for_streak``). Forces AT LEAST one real lookup per
+    failure streak, then gets out of the way instead of re-triggering every
+    turn while the streak count stays flat.
+    """
+    rejections = int(current_agent.get("forced_memory_rejections", 0) or 0)
+    if rejections >= FORCE_READ_MEMORY_MAX_REJECTIONS:
+        return False
+    consecutive_failures = int(current_agent.get("consecutive_failures", 0) or 0)
+    if consecutive_failures < FORCE_READ_MEMORY_FAILURE_THRESHOLD:
+        return False
+    return not current_agent.get("memory_consulted_for_streak", False)
+
+
+def _force_read_memory_rejection_text(current_agent: dict) -> str:
+    """Feedback shown when a non-ReadMemory action is rejected by the hard gate."""
+    consecutive_failures = int(current_agent.get("consecutive_failures", 0) or 0)
+    return (
+        f"**Action rejected -- not executed.** You have {consecutive_failures} consecutive "
+        "action failures, which requires consulting the memory library before any other "
+        "action is accepted. Your submitted action was discarded (no step budget was "
+        "spent). Your ONLY valid <ACTION> this turn is `ReadMemory(<file_name>)` -- pick "
+        "the entry from the index above that matches your current error. Any other "
+        "action will continue to be rejected."
+    )
+
+
 def parse_dual_agent_response(response_text: str, enable_summary: bool = False) -> Dict[str, Any]:
     """Parse THINK/ACTION/(COMMUNICATE)/(SUMMARY) from a model response."""
     think_block = _extract_tag_block(response_text, "THINK")
@@ -228,9 +670,18 @@ def parse_dual_agent_response(response_text: str, enable_summary: bool = False) 
     )
     communication_text = communicate_block.strip() if communicate_block and communicate_block.strip() else ""
     updated_summary = summary_block.strip() if summary_block and summary_block.strip() else ""
-    parsed_action = parse_action_string(action_string)
-    if parsed_action.get("action_type") == "communication":
-        communication_text = parsed_action.get("message", communication_text)
+
+    memory_file_name = _parse_read_memory_action(action_string)
+    if memory_file_name is not None:
+        parsed_action = {
+            "action_type": "memory_lookup",
+            "action_name": "ReadMemory",
+            "file_name": memory_file_name,
+        }
+    else:
+        parsed_action = parse_action_string(action_string)
+        if parsed_action.get("action_type") == "communication":
+            communication_text = parsed_action.get("message", communication_text)
     return {
         "thinking_text": thinking_text,
         "action_string": action_string,
@@ -260,6 +711,26 @@ def initialize_agent_state(
         "fail_reason": None,
         "consecutive_failures": 0,
         "last_error_message": None,
+        # Counts real ReadMemory(<file_name>) lookups this agent has made so
+        # far (see the "memory_lookup" branch below). Used purely to drive
+        # the strength of the in-prompt nudge towards consulting the memory
+        # library -- it is NOT a hard requirement/gate, just a way to make
+        # the reminder more specific/insistent the longer an agent goes
+        # without ever opening it (models tend to ignore generic, one-off
+        # "you may use X" suggestions but respond better to "you have never
+        # done X and are now failing" framing).
+        "memory_reads_used": 0,
+        # Set once _build_done_checklist_nudge_text has fired for this agent
+        # (near step-budget exhaustion), so the reminder is shown only once
+        # rather than on every remaining step.
+        "done_checklist_nudged": False,
+        # Count of non-ReadMemory actions rejected by the hard gate in
+        # _should_force_read_memory (see FORCE_READ_MEMORY_MAX_REJECTIONS).
+        "forced_memory_rejections": 0,
+        # Whether a real ReadMemory lookup has happened during the CURRENT
+        # consecutive-failure streak. Gates _should_force_read_memory so the
+        # hard gate forces exactly one real lookup per streak.
+        "memory_consulted_for_streak": False,
     }
 
 
@@ -449,6 +920,7 @@ def save_dual_conversation_log(state: dict, output_dir: str):
             "agent_2_steps": state.get("agent_2", {}).get("step_count", 0),
             "communication_events": len(state.get("communication_history", [])),
             "mode": "dual_agent",
+            "token_usage": state.get("token_usage", {}),
         },
         "messages": [],
         "images": [],
@@ -532,6 +1004,7 @@ def save_dual_episode_log(state: dict, output_dir: str, env) -> None:
         "communication_history": state.get("communication_history", []),
         "action_sequence": env.get_action_sequence() if hasattr(env, "get_action_sequence") else "(no action records)",
         "trajectory": trajectory,
+        "token_usage": state.get("token_usage", {}),
         "timestamp": datetime.now().isoformat(),
     }
     with open(filepath, "w", encoding="utf-8") as f:
@@ -548,7 +1021,17 @@ def run_dual_agent_loop(
     collaboration_mode: str = "alternating",
     switch_interval: int = 1,
 ):
-    """Run a lightweight dual-agent collaboration loop on one shared ProcTHOR env."""
+    """Run a lightweight dual-agent collaboration loop on one shared ProcTHOR env.
+
+    Feature flags (read from ``config["dual_agent"]`` / ``config["image"]``):
+      * ``history_feedback``    — inject each step's action + result into history.
+      * ``llm_history_feedback``— a second LLM analyzes recent history and emits
+        concise per-step annotations that replace the raw action+error text.
+      * ``partner_view``        — inject a fresh first-person image rendered from
+        the partner body's camera at each decision step.
+      * ``image.scale`` / ``image.recent_steps`` / ``image.partner_view_scale`` —
+        control image resolution to bound request-body size on long episodes.
+    """
     task_prompt = task_config.get("instruction") or task_config.get("description") or "Complete the task."
     per_agent_steps = int(task_config.get("max_steps", config.get("max_steps", 30)))
     max_global_steps = 2 * per_agent_steps
@@ -600,9 +1083,48 @@ def run_dual_agent_loop(
         "success": False,
         "fail_reason": None,
         "failure_type": None,
+        "last_acting_agent": None,
+        "token_usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "api_calls": 0,
+        },
+        # Skill-memory library (mirrors ai2thor/main.py + RPent's
+        # resources/<env>/memory/): a reviewed MEMORY.md index plus
+        # feedback_*.md leaf notes. The index is embedded into the system
+        # prompt every turn; leaf notes are fetched on demand via the
+        # ReadMemory(<file_name>) pseudo-action intercepted below.
+        "memory_library": MemoryLibrary.for_env("procthor", agent_mode="dual"),
+        "history_feedback": bool(config.get("dual_agent", {}).get("history_feedback", False)),
+        "llm_history_feedback": bool(config.get("dual_agent", {}).get("llm_history_feedback", False)),
+        # Image downscale factor for VLM inputs (``image.scale``). 1.0 = no scaling.
+        "image_scale": _resolve_image_scale(config),
+        # Number of recent history steps kept at original resolution; older
+        # history images are downscaled to ``image_scale``. Current obs is
+        # always full-resolution.
+        "image_recent_steps": _resolve_image_recent_steps(config),
+        # Partner-view injection: when enabled, each decision step also feeds
+        # the model a fresh first-person image from the partner body's camera.
+        "partner_view": bool(config.get("dual_agent", {}).get("partner_view", False)),
+        "partner_view_scale": float(
+            (config.get("image", {}) or {}).get("partner_view_scale")
+            or _resolve_image_scale(config)
+        ),
         "agent_1": initialize_agent_state("agent_1", agent_vlms["agent_1"], agent_1_observation, per_agent_steps),
         "agent_2": initialize_agent_state("agent_2", agent_vlms["agent_2"], agent_2_observation, per_agent_steps),
     }
+
+    from mllm_base_agent.llm.messages import AIMessage, HumanMessage, SystemMessage
+
+    # LLM History Analyzer: one analyzer per agent, built from that agent's own
+    # VLM ("use the current LLM").  Only instantiated when the feature is on.
+    if state.get("llm_history_feedback"):
+        state["history_analyzers"] = {
+            aid: HistoryAnalyzerAgent(vlm) for aid, vlm in agent_vlms.items() if vlm is not None
+        }
+    else:
+        state["history_analyzers"] = {}
 
     while state["global_step_count"] < state["max_global_steps"]:
         refresh_system_step_expected_agents(state)
@@ -619,7 +1141,7 @@ def run_dual_agent_loop(
         other_agent_id = "agent_2" if current_agent_id == "agent_1" else "agent_1"
 
         #   ：    "   agent"           （  agent      ，
-        #     step_with_action_dict            frame，      Pass） 
+        #     step_with_action_dict            frame，      Pass）
         if getattr(env, "agent_count", 1) > 1 and hasattr(env, "get_observation_for_agent"):
             last_acting = state.get("last_acting_agent")
             needs_refresh = (
@@ -637,22 +1159,92 @@ def run_dual_agent_loop(
 
         print(f"\n{'=' * 60}\n🧠 {current_agent_id.upper()} Step {current_agent['step_count'] + 1}\n{'=' * 60}")
 
-        from mllm_base_agent.llm.messages import AIMessage, HumanMessage, SystemMessage
-
+        memory_library: Optional[MemoryLibrary] = state.get("memory_library")
+        memory_index_block = memory_library.index_prompt_block() if memory_library else ""
         system_prompt = get_dual_procthor_prompt(enable_summary=enable_summary).format(
             task_prompt=task_prompt,
             shared_context=build_shared_context(state, current_agent_id),
+            memory_index_block=memory_index_block,
         )
         messages = [SystemMessage(content=system_prompt)]
 
-        for entry in current_agent.get("short_term_history", [])[-max_history:]:
+        history_feedback = state.get("history_feedback", False)
+        llm_history_feedback = state.get("llm_history_feedback", False)
+        image_scale = state.get("image_scale", 1.0)
+        image_recent_steps = state.get("image_recent_steps", 0)
+
+        recent_history = current_agent.get("short_term_history", [])[-max_history:]
+        n_history = len(recent_history)
+
+        # LLM History Analyzer: produce per-step annotations that REPLACE the
+        # raw "Your previous action: X / Result: FAILED - Y" text.  Only runs
+        # when --llm-history-feedback is enabled; otherwise the original
+        # history_feedback injection below is used unchanged.  On any failure
+        # ``analyzer_annotations`` stays None and we gracefully fall back to
+        # the raw text.
+        analyzer_annotations = None
+        if llm_history_feedback and recent_history:
+            analyzer = state.get("history_analyzers", {}).get(current_agent_id)
+            if analyzer is not None:
+                try:
+                    analyzer_annotations, analyzer_response = analyzer.analyze(recent_history, task_prompt)
+                    if analyzer_response is not None:
+                        _accumulate_token_usage(
+                            state, _extract_token_usage_from_response(analyzer_response)
+                        )
+                except Exception as exc:
+                    print(f"⚠️  History analyzer failed: {exc}")
+                    analyzer_annotations = None
+
+        for idx, entry in enumerate(recent_history):
             content = []
             img_path = entry.get("image_path")
             if img_path and os.path.exists(img_path):
-                with open(img_path, "rb") as f:
-                    img_b64 = base64.b64encode(f.read()).decode("utf-8")
-                content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}})
-            content.append({"type": "text", "text": f"Step {entry.get('step', 0)}"})
+                # Distance-based scaling: entries within ``image_recent_steps``
+                # of the current step keep full resolution; older entries are
+                # downscaled to ``image_scale`` to control request-body size.
+                distance = n_history - idx
+                entry_scale = 1.0 if distance <= image_recent_steps else image_scale
+                try:
+                    content.append(
+                        {"type": "image_url", "image_url": {"url": _read_image_as_data_url(img_path, scale=entry_scale)}}
+                    )
+                except Exception:
+                    content.append({"type": "text", "text": "[Image unavailable]"})
+            step_text = f"Step {entry.get('step', 0)}"
+
+            memory_lookup_result = entry.get("memory_lookup_result")
+            if memory_lookup_result:
+                # ReadMemory(...) result: shown in full regardless of
+                # history_feedback/analyzer settings, since it is the direct
+                # answer to a lookup the agent itself just requested (not an
+                # action outcome to summarize).
+                step_text += f"\n{memory_lookup_result}"
+                content.append({"type": "text", "text": step_text})
+                messages.append(HumanMessage(content=content))
+                messages.append(AIMessage(content=entry.get("raw_response", "")))
+                continue
+
+            annotation = (
+                analyzer_annotations[idx]
+                if (analyzer_annotations is not None and idx < len(analyzer_annotations))
+                else None
+            )
+            if annotation:
+                # LLM history analyzer mode: replace the raw action + error
+                # string with the analyzer's concise, actionable per-step
+                # insight.
+                step_text += f"\nHistory analysis: {annotation}"
+            elif history_feedback:
+                prev_action = entry.get("action_string", "")
+                prev_error = entry.get("error_message")
+                if prev_action:
+                    step_text += f"\nYour previous action: {prev_action}"
+                    if prev_error:
+                        step_text += f"\nResult: FAILED - {prev_error}"
+                    else:
+                        step_text += "\nResult: SUCCESS"
+            content.append({"type": "text", "text": step_text})
             messages.append(HumanMessage(content=content))
             messages.append(AIMessage(content=entry.get("raw_response", "")))
 
@@ -668,22 +1260,75 @@ def run_dual_agent_loop(
 
         last_error = current_agent.get("last_error_message")
         if last_error:
+            # Shown on every step (independent of history_feedback), so it
+            # works even when --history-feedback is off.
+            error_banner = f"**Last action error:** {last_error}\nAdjust your plan before repeating the same action."
+            memory_nudge = _build_memory_nudge_text(current_agent)
+            if memory_nudge:
+                error_banner += f"\n{memory_nudge}"
             current_content.append(
                 {
                     "type": "text",
-                    "text": f"**Last action error:** {last_error}\nAdjust your plan before repeating the same action.",
+                    "text": error_banner,
                 }
             )
+
+        done_checklist_nudge = _build_done_checklist_nudge_text(current_agent)
+        if done_checklist_nudge:
+            current_content.append(
+                {
+                    "type": "text",
+                    "text": done_checklist_nudge,
+                }
+            )
+
+        # Partner-view injection: render a fresh first-person image from the
+        # partner body's camera so the acting agent can observe the shared
+        # scene from a different angle.  Only when --partner-view is enabled
+        # and the env actually has 2 embodied agents.
+        partner_view = state.get("partner_view", False)
+        partner_view_scale = state.get("partner_view_scale", image_scale)
+        if partner_view and getattr(env, "agent_count", 1) > 1:
+            partner_thor_id = AGENT_TO_THOR_ID.get(other_agent_id, 1)
+            try:
+                partner_obs = env.get_observation_for_agent(partner_thor_id)
+                partner_image_path = getattr(partner_obs, "image_path", None)
+                if partner_image_path and os.path.exists(partner_image_path):
+                    current_content.append(
+                        {
+                            "type": "text",
+                            "text": (
+                                "**Partner's current view** (rendered fresh from your "
+                                "partner body's camera — use it to observe the shared "
+                                "scene from a different angle and cross-check your "
+                                "partner's reported findings):"
+                            ),
+                        }
+                    )
+                    current_content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": _read_image_as_data_url(
+                                    partner_image_path, scale=partner_view_scale
+                                )
+                            },
+                        }
+                    )
+            except Exception as exc:
+                print(f"⚠️  Partner-view render failed: {exc}")
 
         image_path = observation.image_path if observation else None
         if not image_path or not os.path.exists(image_path):
             mark_agent_failure(state, current_agent_id, "env_error", "Missing observation image")
             continue
 
-        with open(image_path, "rb") as f:
-            image_b64 = base64.b64encode(f.read()).decode("utf-8")
-
-        current_content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}})
+        # Current observation: always full resolution — it is the most critical
+        # visual input for the agent's immediate decision.  When image_scale <
+        # 1.0 only *historical* images are downscaled, never the current frame.
+        current_content.append(
+            {"type": "image_url", "image_url": {"url": _read_image_as_data_url(image_path, scale=1.0)}}
+        )
         current_content.append(
             {
                 "type": "text",
@@ -693,13 +1338,24 @@ def run_dual_agent_loop(
         )
         messages.append(HumanMessage(content=current_content))
 
+        # --- Call VLM with API retries + token accounting -----------------
         response_text = None
         last_api_error = None
+        step_token_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "api_calls": 0,
+        }
         for api_attempt in range(LOCAL_RETRY_CONFIG["api_max_retries"]):
             try:
                 print(f"📡 Calling VLM... (API attempt {api_attempt + 1}/{LOCAL_RETRY_CONFIG['api_max_retries']})")
                 response = current_agent["vlm"].invoke(messages)
                 response_text = response.content if hasattr(response, "content") else str(response)
+                usage = _extract_token_usage_from_response(response)
+                _accumulate_token_usage(state, usage)
+                for key in step_token_usage:
+                    step_token_usage[key] += usage.get(key, 0)
                 break
             except Exception as api_error:
                 err_str = str(api_error)
@@ -722,6 +1378,7 @@ def run_dual_agent_loop(
                     "thinking": "",
                     "action_string": "",
                     "raw_response": "",
+                    "llm_token_usage": dict(step_token_usage),
                     "parse_error": str(last_api_error),
                     "failure_type": "api_error",
                     "image_path": image_path,
@@ -731,6 +1388,7 @@ def run_dual_agent_loop(
             mark_agent_failure(state, current_agent_id, "api_error", reason)
             continue
 
+        # --- Parse response with parse retries ----------------------------
         parsed = None
         parse_error = None
         for parse_attempt in range(LOCAL_RETRY_CONFIG["max_retries"]):
@@ -748,6 +1406,10 @@ def run_dual_agent_loop(
                     try:
                         response = current_agent["vlm"].invoke(messages)
                         response_text = response.content if hasattr(response, "content") else str(response)
+                        usage = _extract_token_usage_from_response(response)
+                        _accumulate_token_usage(state, usage)
+                        for key in step_token_usage:
+                            step_token_usage[key] += usage.get(key, 0)
                     except Exception as recall_error:
                         parse_error = recall_error
                     continue
@@ -762,7 +1424,8 @@ def run_dual_agent_loop(
                     "global_step": state["global_step_count"] + 1,
                     "thinking": "",
                     "action_string": "",
-                    "raw_response": response_text[:2000],
+                    "raw_response": (response_text or "")[:2000],
+                    "llm_token_usage": dict(step_token_usage),
                     "parse_error": str(parse_error),
                     "failure_type": "parse_error",
                     "image_path": image_path,
@@ -805,6 +1468,79 @@ def run_dual_agent_loop(
         print(f"✓ Action String: {action_string}")
         print(f"✓ Parsed Action: {action_dict}")
 
+        # --- Hard gate: force a real ReadMemory(...) after repeated failures --
+        # Mirrors mllm_base_agent/dual_agent/ai2thor/main.py. Once
+        # consecutive_failures reaches FORCE_READ_MEMORY_FAILURE_THRESHOLD,
+        # any action OTHER than a real ReadMemory(...) is discarded here --
+        # not executed, no step consumed, no handoff -- and the agent is
+        # re-prompted with an explicit rejection message on its immediate
+        # next turn. Bounded by FORCE_READ_MEMORY_MAX_REJECTIONS.
+        if action_dict.get("action_type") != "memory_lookup" and _should_force_read_memory(current_agent):
+            current_agent["forced_memory_rejections"] = current_agent.get("forced_memory_rejections", 0) + 1
+            rejection_text = _force_read_memory_rejection_text(current_agent)
+            print(f"🚫 {rejection_text}")
+            current_agent["short_term_history"].append(
+                {
+                    "step": current_agent["step_count"],
+                    "image_path": None,
+                    "raw_response": response_text,
+                    "action_string": action_string,
+                    "error_message": None,
+                    "memory_lookup_result": f"[Memory Gate] {rejection_text}",
+                }
+            )
+            current_agent["short_term_history"] = current_agent["short_term_history"][-max_history:]
+            # Same agent retries immediately (no handoff, no step consumed),
+            # exactly like a real ReadMemory lookup would.
+            continue
+
+        # --- Memory lookup: free action, no env step, no step-budget cost --
+        # ReadMemory(<file_name>) never reaches the ProcTHOR environment and
+        # does NOT increment current_agent["step_count"] / global_step_count
+        # (mirrors ai2thor/main.py + RPent's "reading memory is free"
+        # design -- see mllm_base_agent/tools/memory.py). The looked-up
+        # content is folded into short_term_history as a synthetic "tool
+        # result" turn so the SAME agent sees it on its immediate next call,
+        # then keeps its turn (does not hand off to the partner) since no
+        # world-state action was taken yet.
+        if action_dict.get("action_type") == "memory_lookup":
+            file_name = action_dict.get("file_name", "MEMORY.md")
+            memory_library = state.get("memory_library")
+            if memory_library is not None:
+                lookup_result = memory_library.read_entry(file_name)
+            else:
+                lookup_result = {"error": "memory library not configured"}
+
+            if "error" in lookup_result:
+                memory_text = f"[Memory] ReadMemory({file_name}) failed: {lookup_result['error']}"
+                print(f"⚠️  {memory_text}")
+            else:
+                memory_text = (
+                    f"[Memory] Contents of {file_name}:\n{lookup_result.get('content', '')}"
+                )
+                print(f"📖 Memory lookup: {file_name} ({lookup_result.get('size', 0)} chars)")
+
+            current_agent["short_term_history"].append(
+                {
+                    "step": current_agent["step_count"],
+                    "image_path": None,
+                    "raw_response": response_text,
+                    "action_string": action_string,
+                    "error_message": None,
+                    "memory_lookup_result": memory_text,
+                }
+            )
+            current_agent["short_term_history"] = current_agent["short_term_history"][-max_history:]
+            current_agent["memory_reads_used"] = current_agent.get("memory_reads_used", 0) + 1
+            # A real ReadMemory lookup satisfies the hard gate for THIS failure
+            # streak: mark it consulted and reset the rejection counter so a
+            # LATER, separate failure streak gets the full budget again.
+            current_agent["memory_consulted_for_streak"] = True
+            current_agent["forced_memory_rejections"] = 0
+            # Same agent keeps acting next iteration (no handoff, no step
+            # consumed): just loop back to the top of the while-loop.
+            continue
+
         trajectory_entry = {
             "step": current_agent["step_count"] + 1,
             "global_step": state["global_step_count"] + 1,
@@ -812,6 +1548,7 @@ def run_dual_agent_loop(
             "action_string": action_string,
             "action": action_dict,
             "raw_response": response_text,
+            "llm_token_usage": dict(step_token_usage),
             "image_path": image_path,
             "communication": communication_text,
             "updated_summary": parsed.get("updated_summary", ""),
@@ -824,6 +1561,7 @@ def run_dual_agent_loop(
         if enable_summary and parsed.get("updated_summary"):
             current_agent["long_term_summary"] = parsed["updated_summary"]
 
+        # --- Communication / Pass: no env step, hand off ------------------
         if action_dict.get("action_type") == "communication":
             trajectory_entry["reward"] = 0.0
             trajectory_entry["error_message"] = None
@@ -833,12 +1571,15 @@ def run_dual_agent_loop(
                     "step": current_agent["step_count"],
                     "image_path": image_path,
                     "raw_response": response_text,
+                    "action_string": trajectory_entry.get("action_string", ""),
+                    "error_message": trajectory_entry.get("error_message"),
                 }
             )
             current_agent["short_term_history"] = current_agent["short_term_history"][-max_history:]
             handoff_agent_or_finish(state, current_agent_id, "communication action")
             continue
 
+        # --- Task completion (DONE / FAIL) --------------------------------
         if action_dict.get("action_type") == "task_completion":
             trajectory_entry["reward"] = 0.0
             trajectory_entry["error_message"] = None
@@ -848,6 +1589,8 @@ def run_dual_agent_loop(
                     "step": current_agent["step_count"],
                     "image_path": image_path,
                     "raw_response": response_text,
+                    "action_string": trajectory_entry.get("action_string", ""),
+                    "error_message": trajectory_entry.get("error_message"),
                 }
             )
 
@@ -859,7 +1602,8 @@ def run_dual_agent_loop(
                     state["failure_type"] = None
                     print(f"✅ DONE verified (score={score:.2f})")
                     break
-                current_agent["last_error_message"] = "DONE was rejected by evaluator"
+                done_reject_msg = "DONE was rejected by evaluator"
+                current_agent["last_error_message"] = done_reject_msg
                 print(f"❌ DONE rejected by evaluator (score={score:.2f})")
                 handoff_agent_or_finish(
                     state,
@@ -877,6 +1621,7 @@ def run_dual_agent_loop(
             )
             continue
 
+        # --- Execute the action on the current agent's body ---------------
         thor_agent_id = AGENT_TO_THOR_ID.get(current_agent_id, 0)
         try:
             #       thor_agent_id   ；            
@@ -900,6 +1645,8 @@ def run_dual_agent_loop(
                 "step": current_agent["step_count"],
                 "image_path": image_path,
                 "raw_response": response_text,
+                "action_string": trajectory_entry.get("action_string", ""),
+                "error_message": error_message,
             }
         )
         current_agent["short_term_history"] = current_agent["short_term_history"][-max_history:]
@@ -918,10 +1665,15 @@ def run_dual_agent_loop(
         if error_message:
             current_agent["consecutive_failures"] += 1
             current_agent["last_error_message"] = error_message
+            # A new failure within the streak means whatever memory entry was
+            # read before (if any) did not resolve it -- re-arm the hard gate
+            # so it can force a (possibly different) lookup again.
+            current_agent["memory_consulted_for_streak"] = False
             print(f"  ⚠️  Action failed: {error_message}")
         else:
             current_agent["consecutive_failures"] = 0
             current_agent["last_error_message"] = None
+            current_agent["memory_consulted_for_streak"] = False
             print("✓ Action executed successfully")
 
         if current_agent["consecutive_failures"] >= 4:
@@ -981,6 +1733,74 @@ def main():
     parser.add_argument("--agent1", type=str, default=None, help="Agent 1 single-agent config path")
     parser.add_argument("--agent2", type=str, default=None, help="Agent 2 single-agent config path")
     parser.add_argument("--print-config", action="store_true", help="Print config and exit")
+    parser.add_argument(
+        "--history-feedback",
+        action="store_true",
+        help="Inject each step's action + result (incl. distance error) into history so the agent can reason over the full action-outcome sequence",
+    )
+    parser.add_argument(
+        "--llm-history-feedback",
+        action="store_true",
+        help=(
+            "Enable the LLM History Analyzer Agent: spawn a second LLM (the SAME "
+            "model as the actors) that manages and analyzes each agent's recent "
+            "action-outcome history and emits concise, actionable per-step "
+            "annotations. These annotations REPLACE the raw 'Your previous "
+            "action: X / Result: FAILED - Y' text that --history-feedback "
+            "injects, giving the acting agent high-information guidance instead "
+            "of low-level action/error strings. Does NOT alter --history-feedback "
+            "when disabled; works with or without it."
+        ),
+    )
+    parser.add_argument(
+        "--image-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Downscale factor for images sent to the VLM (0 < scale <= 1.0). "
+            "e.g. --image-scale 0.5 resizes 800x600 -> 400x300 before base64 "
+            "encoding, shrinking the request body and avoiding HTTP 413 on long "
+            "multi-image episodes. Default 1.0 = no scaling (original behavior)."
+        ),
+    )
+    parser.add_argument(
+        "--image-recent-steps",
+        type=int,
+        default=0,
+        help=(
+            "Number of recent history steps whose images are kept at original "
+            "resolution (full 800x600). Older history images are downscaled to "
+            "--image-scale. The current observation is ALWAYS full-resolution "
+            "regardless of this setting. Default 0 = only the current observation "
+            "is full-resolution; all history images are downscaled (prior behavior)."
+        ),
+    )
+    parser.add_argument(
+        "--partner-view",
+        action="store_true",
+        help=(
+            "Enable partner-view injection: at each decision step, also feed the "
+            "model a fresh first-person image rendered from the partner body's "
+            "current camera (via env.get_observation_for_agent). This lets the "
+            "acting agent observe the shared scene from a different angle and "
+            "reason about what its partner can see. Only effective when the env "
+            "has 2 embodied agents. Default off (original behavior: each agent "
+            "only sees its own view)."
+        ),
+    )
+    parser.add_argument(
+        "--partner-view-scale",
+        type=float,
+        default=None,
+        help=(
+            "Downscale factor for the partner-view image (0 < scale <= 1.0). "
+            "When --partner-view is enabled, the partner's current observation "
+            "image is resized by this factor before base64 encoding. Defaults to "
+            "the value of --image-scale (so partner images are downscaled the "
+            "same as historical images). Set to 1.0 to keep partner images at "
+            "full 800x600 resolution."
+        ),
+    )
     args = parser.parse_args()
 
     print(f"\n{'=' * 60}\n🔧         \n{'=' * 60}\n    : {args.config}")
@@ -1000,6 +1820,72 @@ def main():
     dual_config = config_dict.setdefault("dual_agent", {})
     dual_config.setdefault("equal_collaboration", True)
     dual_config["collaboration_mode"] = args.collaboration_mode
+
+    # --- Feature flags (ported from ai2thor/main.py) ---------------------
+    dual_config["history_feedback"] = bool(args.history_feedback)
+    if args.history_feedback:
+        print("✓ History feedback: enabled (action + result injected into per-step history)")
+
+    dual_config["llm_history_feedback"] = bool(args.llm_history_feedback)
+    if args.llm_history_feedback:
+        print(
+            "✓ LLM history feedback: enabled (a second LLM analyzes the recent "
+            "action/outcome history and replaces the raw action+error text with "
+            "actionable per-step annotations)"
+        )
+
+    # Image downscale: clamp to (0, 1.0]; values outside this range are treated
+    # as 1.0 (no scaling) so existing behavior is preserved by default.
+    _image_scale = float(args.image_scale or 1.0)
+    if _image_scale <= 0.0 or _image_scale > 1.0:
+        print(f"⚠️  --image-scale {_image_scale} out of range (0, 1.0]; ignoring (no scaling)")
+        _image_scale = 1.0
+    config_dict.setdefault("image", {})["scale"] = _image_scale
+    if _image_scale < 1.0:
+        print(
+            f"✓ Image downscale: enabled (scale={_image_scale}, 800x600 -> "
+            f"{int(round(800 * _image_scale))}x{int(round(600 * _image_scale))})"
+        )
+
+    # Image recent-steps: K most-recent history images stay at original
+    # resolution; older ones are downscaled to --image-scale.
+    _image_recent_steps = int(args.image_recent_steps or 0)
+    if _image_recent_steps < 0:
+        print(f"⚠️  --image-recent-steps {_image_recent_steps} < 0; treating as 0")
+        _image_recent_steps = 0
+    config_dict.setdefault("image", {})["recent_steps"] = _image_recent_steps
+    if _image_recent_steps > 0 and _image_scale < 1.0:
+        print(
+            f"✓ Image recent-steps: keeping the {_image_recent_steps} most-recent "
+            f"history images at original 800x600, older ones at scale={_image_scale}. "
+            f"Current observation is always full-resolution."
+        )
+    elif _image_recent_steps > 0 and _image_scale >= 1.0:
+        print(
+            f"ℹ️  --image-recent-steps {_image_recent_steps} has no effect when "
+            f"--image-scale is 1.0 (no downscaling configured)"
+        )
+
+    # Partner-view injection: feed the acting agent a fresh image rendered from
+    # the partner body's camera.  ``--partner-view-scale`` defaults to
+    # ``--image-scale``.
+    dual_config["partner_view"] = bool(args.partner_view)
+    _partner_view_scale = args.partner_view_scale
+    if _partner_view_scale is None:
+        _partner_view_scale = _image_scale
+    _partner_view_scale = float(_partner_view_scale or 1.0)
+    if _partner_view_scale <= 0.0 or _partner_view_scale > 1.0:
+        print(
+            f"⚠️  --partner-view-scale {_partner_view_scale} out of range (0, 1.0]; "
+            f"ignoring (using --image-scale={_image_scale})"
+        )
+        _partner_view_scale = _image_scale
+    config_dict.setdefault("image", {})["partner_view_scale"] = _partner_view_scale
+    if args.partner_view:
+        print(
+            f"✓ Partner view: enabled (injects the partner body's current "
+            f"first-person image at scale={_partner_view_scale} into each step)"
+        )
 
     output_dir = args.output_dir or config.get("experiment.output_dir", "outputs")
     if args.output_dir and len(task_names) == 1:
