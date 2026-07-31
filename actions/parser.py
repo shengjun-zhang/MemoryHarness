@@ -330,6 +330,10 @@ def _parse_legacy_action_string(action_string: str, env_type: str = "ai2thor", e
         return {"action_type": "carla_semantic", "action_name": action_string, "parameters": {}}
     if action_string == "DropHandObject":
         return {"action_type": "interaction", "action_name": "DropHandObject"}
+    # ThrowObject operates on the item already held in hand, so unlike other
+    # interaction actions it is a valid bare action with no object argument.
+    if action_string == "ThrowObject":
+        return {"action_type": "interaction", "action_name": "ThrowObject"}
     if "(" not in action_string or not action_string.endswith(")"):
         raise ValueError(f"Unrecognized action format: {action_string}")
 

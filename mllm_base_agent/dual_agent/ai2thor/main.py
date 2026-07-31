@@ -1783,8 +1783,17 @@ def run_dual_agent_loop(
 
         # --- Communication / Pass: no env step, hand off ------------------
         if action_dict.get("action_type") == "communication":
+            is_pass = action_dict.get("action_name") == "Pass"
             trajectory_entry["reward"] = 0.0
-            trajectory_entry["error_message"] = None
+            trajectory_entry["error_message"] = (
+                "Pass skipped a turn; take a productive action unless explicitly waiting on a partner handoff."
+                if is_pass
+                else None
+            )
+            if is_pass:
+                current_agent["last_error_message"] = trajectory_entry["error_message"]
+                current_agent["consecutive_failures"] += 1
+                current_agent["memory_consulted_for_streak"] = False
             current_agent["structured_trajectory"].append(trajectory_entry)
             current_agent["short_term_history"].append(
                 {
@@ -1796,7 +1805,13 @@ def run_dual_agent_loop(
                 }
             )
             current_agent["short_term_history"] = current_agent["short_term_history"][-max_history:]
-            handoff_agent_or_finish(state, current_agent_id, "communication / pass action")
+            if is_pass:
+                state["current_agent"] = "agent_2" if current_agent_id == "agent_1" else "agent_1"
+                state["current_turn_steps"] = 0
+                state["turn_count"] += 1
+                print(f"🔄 Pass handoff to {state['current_agent']}")
+            else:
+                handoff_agent_or_finish(state, current_agent_id, "communication action")
             continue
 
         # --- Task completion (DONE / FAIL) --------------------------------

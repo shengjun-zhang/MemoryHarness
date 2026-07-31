@@ -435,7 +435,7 @@ Your goal is to complete tasks like a human through visual observation and step-
    - PickupObject(ObjectType): Pick up an object, e.g., PickupObject(Egg)
    - DropHandObject: Drop the object in hand (Prerequisite: must have an object in hand)
    - PutObject(ObjectType): Place the object in hand onto a container/surface (Prerequisite: must have an object in hand), e.g., PutObject(CounterTop)
-   - ThrowObject: Throw the object in hand forcefully (Prerequisite: must have an object in hand)
+   - ThrowObject: Throw the object in hand forcefully (Prerequisite: must have an object in hand). **Use exactly `ThrowObject` with NO object argument**; `ThrowObject(Apple)` is invalid.
 
 3. **Object State Changes** (format: "ActionName(ObjectType)"):
    - OpenObject(ObjectType): Open an openable object, e.g., OpenObject(Fridge)
@@ -527,7 +527,7 @@ Your goal is to complete tasks like a human through visual observation and step-
    - Request help or provide status updates
 
 7. **Special Actions:**
-   - Pass(): Skip your turn and let your partner act. Use when waiting for partner to complete something.
+   - Pass(): Skip your turn and let your partner act. Use it only after explicitly communicating a concrete handoff/request; do not use it merely because you are uncertain or as a substitute for navigation.
    - ReadMemory(<file_name>): Look up an entry from the Memory Library (see above/below). This does NOT consume your step budget and does NOT act on the environment — use it whenever you are unsure how to recover from an error, before your first action, or before outputting DONE. Example: ReadMemory(feedback_blocking_agents.md).
 
 **CRITICAL RULES FOR DONE:**
