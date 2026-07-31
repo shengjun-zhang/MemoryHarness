@@ -20,10 +20,10 @@ log_dir =
 [user_args]
 
 [roles]
-workers = 16
+workers = 8
 worker.memory = 100000
 worker.vcore = 16
-worker.script = RERUN_ALL=1 LLM_HISTORY_FEEDBACK=1 SAVE_NAME=ai2thor-memory-v5_pass_guard bash launch_dual_benchmark.sh ai2thor
+worker.script = RERUN_ALL=1 LLM_HISTORY_FEEDBACK=1 SAVE_NAME=ai2thor-memory-v5_pass_guard_w8_retry bash launch_dual_benchmark.sh ai2thor
 worker.ports = 1
 
 [am]
