@@ -1,0 +1,82 @@
+[base]
+type = ml-easy-job
+
+[resource]
+usergroup = hadoop-camera3d
+queue = root.zw05_training_cluster.hadoop-mmuc.cpu
+
+[dataset]
+dataset_name = 
+dataset_type = 
+dataset_path = 
+
+[job_track]
+demand_id = 91369190
+upstream_jobid = 
+input_dir = 
+output_dir = 
+log_dir = 
+
+[user_args]
+
+[roles]
+workers = 1
+worker.memory = 100000
+worker.vcore = 16
+worker.script = sh smoke_test_gpt55.sh
+worker.ports = 1
+
+[am]
+afo.app.am.resource.mb = 4096
+
+[tensorboard]
+with.tensor.board = false
+
+[docker]
+# 自定义镜像：基于上面这个内部基础镜像扩展而来（见 hope/docker/Dockerfile），
+# 固化了 AI2-THOR Unity build 运行所需的系统级依赖（libuuid/libstdc++/ca-certificates等）
+# 以及 AI2THOR_HOME / AI2THOR_VK_ICD_FILENAMES / AI2THOR_LD_LIBRARY_PATH 默认环境变量。
+# Python venv / Mesa 软件渲染库 / AI2-THOR Unity build 缓存仍从 dolphinfs 挂载读取，
+# 不打进镜像，保持和裸机验证过的产物完全一致。
+#
+# 构建方式（推荐）：直接在美团内部镜像平台网页上构建，不需要本机有 docker 权限：
+#   1. 打开 https://mlp.sankuai.com/ml/#/image/list ，【新建镜像】
+#   2. 基础镜像选择 registry-offlinebiz.sankuai.com/custom_prod/com.sankuai.data.hadoop.gpu/
+#      camera3d/training_cuda12.4-nccl2.21.5-glibc2.28-prod_918d6595:v1.0.0
+#      （即下面这行当前使用的镜像）
+#   3. 切换到 "Dockerfile" 编辑模式，把 hope/docker/Dockerfile 的内容粘贴进去
+#      （构建机默认无外网，该 Dockerfile 只用 yum 内网源安装依赖，无需 --enable-network）
+#   4. 点击【开始构建】，等待 Kaniko 在 K8s 上构建完成并自动推送到 hulk 仓库
+#   5. 构建成功后点击【上线为release】，复制镜像地址，替换下面这行
+# 参考文档：https://km.sankuai.com/collabpage/2475964536
+#
+# 备选方式：若拿到了一台有 docker 权限的物理机/虚拟机，也可用
+# hope/docker/build_and_push.sh 本地构建并推送（CatPaw IDE 所在开发机本身运行在
+# K8s 容器里，缺少运行 dockerd 所需的内核权限，不适用该备选方式）。
+afo.docker.image.name = registry-offlinebiz.sankuai.com/custom_prod/com.sankuai.data.hadoop.gpu/camera3d/training_cuda12.4-nccl2.21.5-glibc2.28-prod-spatialworld_26502192:1.0.0
+
+[data]
+afo.data.prefetch = false
+
+[failover]
+afo.app.support.engine.failover = true
+
+[conda]
+afo.conda.env.name =  
+afo.conda.env.path = 
+afo.conda.store.type = 
+
+[distribute]
+afo.role.worker.gpu_driver_version = 470.103.01
+
+[others]
+afo.app.env.YARN_CONTAINER_RUNTIME_DOCKER_SHM_SIZE_BYTES = 640000000000
+afo.xm.notice.receivers.account = zhangshengjun02
+with_requirements = false
+afo.app.yarn.allocate.timeout.seconds = 3600000
+afo.app.blacklist.fail_times = 16
+afo.role.worker.task.attempt.max.retry = 1
+afo.dolphinfs.otherusers = hadoop-videogen-hl,hadoop-imagen-hl:true,hadoop-vision-data:true,hadoop-videogen-hlsc
+afo.use.hdfs.fuse=true
+afo.use.hdfs.fuse.subpath=:/mnt/hdfs
+afo.use.hdfs.fuse.readonly=false
