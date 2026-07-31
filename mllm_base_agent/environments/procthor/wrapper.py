@@ -323,6 +323,9 @@ class ProcTHOREnvWrapper(BaseEnv):
         self.success_condition: Optional[Dict[str, Any]] = task_config.get("success_condition", None)
         self.success_predicate: Optional[Callable[[dict], bool]] = None  # Will be built when needed
         self.target_description: str = task_config.get("target_description", "")
+        # Metadata may omit a held object from the visible-object list. Keep the
+        # successful pickup target so later held-object actions use the same instance.
+        self._held_object: Optional[Dict[str, str]] = None
         
         #           ，        
         if self.success_condition:
@@ -588,6 +591,7 @@ class ProcTHOREnvWrapper(BaseEnv):
         
         self.task_description = task_description
         self.step_counter = 0  #    step_counter     BaseEnv
+        self._held_object = None
         
         #          ，      （    ）
         if not self.target_object_types:
@@ -1279,6 +1283,8 @@ class ProcTHOREnvWrapper(BaseEnv):
         #      （  ：         Event，    agent{k}/    ）
         if event is None:
             event = self.controller.last_event
+        self._update_held_object(action_name, thor_action, event.metadata)
+        self._log_interaction_evidence(action_name, thor_action, event.metadata)
         frame_agent_id = (
             thor_action.get("agentId") if self.agent_count > 1 else None
         )
@@ -1326,6 +1332,36 @@ class ProcTHOREnvWrapper(BaseEnv):
             print(f"⚠️  Action failed: {error_message}")
         
         return observation, error_message
+
+    def _update_held_object(
+        self, action_name: Optional[str], thor_action: Dict[str, Any], metadata: Dict[str, Any]
+    ) -> None:
+        """Track the exact picked-up instance from successful environment feedback."""
+        if not metadata.get("lastActionSuccess", True):
+            return
+
+        if action_name == "PickupObject" and thor_action.get("objectId"):
+            object_id = str(thor_action["objectId"])
+            self._held_object = {
+                "object_id": object_id,
+                "object_type": object_id.split("|")[0],
+            }
+        elif action_name in {"DropHandObject", "PutObject", "ThrowObject"}:
+            self._held_object = None
+
+    def _log_interaction_evidence(
+        self, action_name: Optional[str], thor_action: Dict[str, Any], metadata: Dict[str, Any]
+    ) -> None:
+        """Emit compact evidence needed to compare action execution with evaluation."""
+        if not thor_action.get("objectId"):
+            return
+
+        inventory_types = [obj.get("objectType", "Unknown") for obj in metadata.get("inventoryObjects", [])]
+        print(
+            "[HarnessEvidence] "
+            f"action={action_name} target_id={thor_action['objectId']} "
+            f"success={metadata.get('lastActionSuccess', True)} inventory={inventory_types}"
+        )
 
     def _resolve_move_magnitude(
         self, magnitude: Optional[float] = None, granularity: Optional[str] = None
@@ -1395,7 +1431,19 @@ class ProcTHOREnvWrapper(BaseEnv):
         #               
         if not object_type:
             return None, f"{action_name} requires object type specification"
-        
+
+        # Toggle actions issued after PickupObject should affect the carried item,
+        # whose metadata is often no longer visible. Without this, a second visible
+        # instance of the same type can be toggled while the task item remains unchanged.
+        if action_name in {"ToggleObjectOn", "ToggleObjectOff"} and self._held_object:
+            candidate_types = SEMANTIC_OBJECT_MAPPING.get(object_type, [object_type])
+            if self._held_object["object_type"] in candidate_types:
+                return {
+                    "action": action_name,
+                    "objectId": self._held_object["object_id"],
+                    "forceAction": False,
+                }, None
+
         #     ：   PickupObject，      
         if action_name == "PickupObject":
             candidate_types = SEMANTIC_OBJECT_MAPPING.get(object_type, [object_type])

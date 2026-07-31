@@ -55,8 +55,10 @@ PROCTHOR_THINK_SYSTEM_PROMPT_WITH_SUMMARY = """You are an embodied agent executi
 **Important Notes:**
 1. **Hand State Management**:
    - You can only hold one object at a time
-   - If you receive an error "already holding an object, cannot pick up new object", you must first use **DropHandObject** to drop the object
-   - DropHandObject, PutObject, ThrowObject can only be executed when holding an object
+   - Treat action feedback as ground truth. A successful PickupObject means the hand is occupied even if the image is ambiguous.
+   - If feedback says you are already holding an object, preserve that task item and navigate to its destination; do not repeat PickupObject or misdiagnose the error as distance or visibility.
+   - After picking up an object that must change state, apply the state-changing action to that held object before navigating away.
+   - DropHandObject, PutObject, ThrowObject can only be executed when holding an object; only drop when it is safe and necessary.
    - PutObject(ContainerType) will neatly place the object on the target container
 
 2. **Abstract Action Notes (No Tools Needed)**:
@@ -72,6 +74,7 @@ PROCTHOR_THINK_SYSTEM_PROMPT_WITH_SUMMARY = """You are an embodied agent executi
    - The system will evaluate your success only after you output DONE or FAIL.
 
 **Environment execution constraints (follow strictly):**
+- **Feedback-first recovery**: The last action's success/error feedback is the authoritative world-state update. After a failed action, identify the stated cause before acting; after two failures of the same action/goal, switch recovery category (change position, view, target instance, or hand state) instead of retrying it again.
 - **Minimize steps**: Prefer the fewest actions needed; always plan the most efficient path to the goal.
 - **Interaction range**: All object interactions must occur within **1 meter** effective range. Distance is judged strictly from **you to the object's surface**, not to the object's center.
 - **Collision behavior**: If your path is blocked, the environment does **not** simulate bouncing or physical push-back—you simply **remain stuck** with **zero** movement for that action.
@@ -225,8 +228,10 @@ PROCTHOR_THINK_SYSTEM_PROMPT_NO_SUMMARY = """You are an embodied agent executing
 **Important Notes:**
 1. **Hand State Management**:
    - You can only hold one object at a time
-   - If you receive an error "already holding an object, cannot pick up new object", you must first use **DropHandObject** to drop the object
-   - DropHandObject, PutObject, ThrowObject can only be executed when holding an object
+   - Treat action feedback as ground truth. A successful PickupObject means the hand is occupied even if the image is ambiguous.
+   - If feedback says you are already holding an object, preserve that task item and navigate to its destination; do not repeat PickupObject or misdiagnose the error as distance or visibility.
+   - After picking up an object that must change state, apply the state-changing action to that held object before navigating away.
+   - DropHandObject, PutObject, ThrowObject can only be executed when holding an object; only drop when it is safe and necessary.
    - PutObject(ContainerType) will neatly place the object on the target container
 
 2. **Abstract Action Notes (No Tools Needed)**:
@@ -242,6 +247,7 @@ PROCTHOR_THINK_SYSTEM_PROMPT_NO_SUMMARY = """You are an embodied agent executing
    - The system will evaluate your success only after you output DONE or FAIL.
 
 **Environment execution constraints (follow strictly):**
+- **Feedback-first recovery**: The last action's success/error feedback is the authoritative world-state update. After a failed action, identify the stated cause before acting; after two failures of the same action/goal, switch recovery category (change position, view, target instance, or hand state) instead of retrying it again.
 - **Minimize steps**: Prefer the fewest actions needed; always plan the most efficient path to the goal.
 - **Interaction range**: All object interactions must occur within **1 meter** effective range. Distance is judged strictly from **you to the object's surface**, not to the object's center.
 - **Collision behavior**: If your path is blocked, the environment does **not** simulate bouncing or physical push-back—you simply **remain stuck** with **zero** movement for that action.
