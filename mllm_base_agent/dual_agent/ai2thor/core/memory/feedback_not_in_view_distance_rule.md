@@ -24,10 +24,12 @@ Use the distance to choose your recovery, do not default to moving:
   - Empirically ~7% of "not in view" errors fall in this bucket (50/728), but
     they are the ones agents get wrong most often (repeatedly moving instead
     of rotating), burning several extra steps each time.
-- **`distance >= 1.0m`**: the object is genuinely far. **MOVE** toward it
-  (`MoveAhead`, or the granular variant if available) while keeping it
-  roughly centered in view; re-check distance after each move rather than
-  covering the whole distance in one blind step.
+- **`distance >= 1.0m`**: the object is genuinely far. First **re-acquire its
+  bearing** from the last image (rotate/tilt if it left frame), then **MOVE**
+  toward that bearing (`MoveAhead`, or the granular variant if available) for
+  1-2 steps and re-check distance. Do not let a subjective "it looks close"
+  impression override the reported value, and never retry the failed
+  interaction until a corrective view/movement action has succeeded.
 
 ## Practical recovery loop
 
@@ -40,7 +42,10 @@ Use the distance to choose your recovery, do not default to moving:
    a partial edge), you likely mis-estimated its direction — do a fuller
    sweep (e.g. 2-3 consecutive `RotateRight`) before assuming it moved or is
    in another room.
-5. Tell your partner what happened (`<COMMUNICATE>`) if this consumes more
+5. After two failed recoveries for the same target, stop changing tiny details
+   of the same attempt: tell your partner the exact distance/error and request
+   a bearing, let them handle it if they can, or switch to another subtask.
+6. Tell your partner what happened (`<COMMUNICATE>`) if this consumes more
    than 2-3 steps — they may already know where the object is, or may be
    able to describe it from their own view.
 
