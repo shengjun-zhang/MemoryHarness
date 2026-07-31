@@ -1223,6 +1223,9 @@ def run_dual_agent_loop(
         "current_agent": "agent_1",
         "current_turn_steps": 0,
         "turn_count": 0,
+        # A single explicit handoff is useful; alternating Pass() calls are not.
+        # Reset only after a real environment action, not after a memory lookup.
+        "passes_since_env_action": 0,
         "communication_history": [],
         "message_queue": [],
         "success": False,
@@ -1784,16 +1787,28 @@ def run_dual_agent_loop(
         # --- Communication / Pass: no env step, hand off ------------------
         if action_dict.get("action_type") == "communication":
             is_pass = action_dict.get("action_name") == "Pass"
+            bare_pass = is_pass and not communication_text.strip()
+            repeated_pass = is_pass and state.get("passes_since_env_action", 0) >= 1
+            rejected_pass = bare_pass or repeated_pass
             trajectory_entry["reward"] = 0.0
-            trajectory_entry["error_message"] = (
-                "Pass skipped a turn; take a productive action unless explicitly waiting on a partner handoff."
-                if is_pass
-                else None
-            )
+            if bare_pass:
+                trajectory_entry["error_message"] = (
+                    "Bare Pass rejected: include a concrete <COMMUNICATE> handoff, or take a real action."
+                )
+            elif repeated_pass:
+                trajectory_entry["error_message"] = (
+                    "Consecutive Pass rejected: the partner must take a real environment action before another handoff."
+                )
+            elif is_pass:
+                trajectory_entry["error_message"] = "Pass accepted as one explicit partner handoff."
+            else:
+                trajectory_entry["error_message"] = None
             if is_pass:
+                state["passes_since_env_action"] = state.get("passes_since_env_action", 0) + 1
                 current_agent["last_error_message"] = trajectory_entry["error_message"]
-                current_agent["consecutive_failures"] += 1
-                current_agent["memory_consulted_for_streak"] = False
+                if rejected_pass:
+                    current_agent["consecutive_failures"] += 1
+                    current_agent["memory_consulted_for_streak"] = False
             current_agent["structured_trajectory"].append(trajectory_entry)
             current_agent["short_term_history"].append(
                 {
@@ -1805,11 +1820,13 @@ def run_dual_agent_loop(
                 }
             )
             current_agent["short_term_history"] = current_agent["short_term_history"][-max_history:]
-            if is_pass:
+            if is_pass and not rejected_pass:
                 state["current_agent"] = "agent_2" if current_agent_id == "agent_1" else "agent_1"
                 state["current_turn_steps"] = 0
                 state["turn_count"] += 1
                 print(f"🔄 Pass handoff to {state['current_agent']}")
+            elif is_pass:
+                print(f"🚫 {trajectory_entry['error_message']}")
             else:
                 handoff_agent_or_finish(state, current_agent_id, "communication action")
             continue
@@ -1857,6 +1874,7 @@ def run_dual_agent_loop(
             continue
 
         # --- Execute the action on the current agent's body ---------------
+        state["passes_since_env_action"] = 0
         thor_agent_id = AGENT_TO_THOR_ID.get(current_agent_id, 0)
         try:
             if getattr(env, "agent_count", 1) > 1:
