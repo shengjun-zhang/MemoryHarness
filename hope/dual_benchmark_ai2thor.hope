@@ -23,7 +23,7 @@ log_dir =
 workers = 8
 worker.memory = 100000
 worker.vcore = 16
-worker.script = RERUN_ALL=1 LLM_HISTORY_FEEDBACK=1 SAVE_NAME=ai2thor-memory-v5_pass_guard_w8_retry bash launch_dual_benchmark.sh ai2thor
+worker.script = RERUN_ALL=1 LLM_HISTORY_FEEDBACK=1 IMAGE_SCALE=0.5 SAVE_NAME=ai2thor-memory-v5_pass_guard_w8_imgscale05 bash launch_dual_benchmark.sh ai2thor
 worker.ports = 1
 
 [am]
