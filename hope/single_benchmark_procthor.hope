@@ -23,7 +23,7 @@ log_dir =
 workers = 32
 worker.memory = 100000
 worker.vcore = 16
-worker.script = RERUN_ALL=1 SAVE_NAME=doubao_procthor_k3_s0.5_w10 bash launch_single_benchmark.sh procthor -k 3 -s 0.5 -w 10
+worker.script = RERUN_ALL=1 SAVE_NAME=doubao_procthor_k3_s0.5_w10_held_toggle_feedback bash launch_single_benchmark.sh procthor -k 3 -s 0.5 -w 10
 worker.ports = 1
 
 [am]
