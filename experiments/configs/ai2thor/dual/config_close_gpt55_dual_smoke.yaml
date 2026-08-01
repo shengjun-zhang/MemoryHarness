@@ -1,0 +1,170 @@
+
+env:
+  type: ai2thor
+  agent_count: 2
+  width: 800
+  height: 600
+  field_of_view: 60
+  grid_size: 0.25
+  render_depth: false
+  render_instance_segmentation: false
+  text_state_mode: first_person
+  visibility_distance: 1.5
+  platform: CloudRendering
+  # gpu_device: 0  # Disabled: real NVIDIA Vulkan ICD on this host makes the ai2thor Unity
+  # process hang in a busy-wait loop during Vulkan init (root cause not yet fixed). Falling
+  # back to the lavapipe (mesa-vulkan) software Vulkan renderer, which does not support/need
+  # gpu_device-based CUDA<->Vulkan UUID mapping. Re-enable once the real-GPU Vulkan path is fixed.
+  # force_vulkan_device_index (NOT gpu_device) is required to actually select the lavapipe CPU
+  # Vulkan device: Unity 2020 does not auto-select a CPU physical device
+  # (requestedDeviceIndex=-1) and instead busy-waits during Vulkan init trying to find a GPU
+  # device, which manifests as the Unity subprocess starting (survives the 1s post-launch
+  # liveness check in ai2thor's _start_unity_thread) but never opening its FIFO handshake pipe --
+  # i.e. Python blocks forever in ai2thor.fifo_server.FifoServer._recv_message()'s
+  # open(self.server_pipe_path, "rb") (NOT subject to server_start_timeout, since that timeout
+  # only bounds the read-after-open phase), which is exactly the "stuck forever right after
+  # AI2ThorEnvWrapper.__init__ starting -> Launching AI2-THOR Unity subprocess, heartbeat
+  # forever, no further log lines" symptom. This was already fixed in the single-agent
+  # ai2thor config and both procthor configs; missing here was the actual root cause of this
+  # dual-agent hang (previous fixes for the fcntl/AI2THOR_HOME cross-node lock issue were a
+  # real but separate bug).
+  force_vulkan_device_index: 0
+  server_start_timeout: 300
+  # ---------------------------------------------------------------------------
+  # AI2-THOR network + runtime dependency configuration (see mllm_base_agent/
+  # environments/ai2thor/wrapper.py::_apply_ai2thor_env_overrides for details)
+  # ---------------------------------------------------------------------------
+  # Fixes "ValueError: Invalid commit_id: ... no build exists for arch=Linux
+  # platforms=CloudRendering" by routing the AWS S3 build-lookup/download through a proxy.
+  http_proxy: http://10.70.18.228:8412
+  https_proxy: http://10.70.18.228:8412
+  # Fixes "Platform CloudRendering failed validation ... Vulkan API driver missing.
+  # CloudRendering requires libvulkan1" without root/apt-get, by pointing LD_LIBRARY_PATH
+  # at a directory that already contains libvulkan.so.1.
+  ai2thor_ld_library_path: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/conda-envs/spatialworld-ai2thor/lib
+  # Optional Mesa lavapipe software-rendering fallback if no vendor GPU Vulkan ICD exists:
+  # ai2thor_vk_icd_filenames: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/conda-envs/mesa-vulkan/share/vulkan/icd.d/lvp_icd.x86_64.json
+  # NOTE: ai2thor_home is intentionally NOT set here. wrapper.py reads
+  # env.ai2thor_home with priority over the AI2THOR_HOME environment variable
+  # (env_config.get("ai2thor_home", os.environ.get("AI2THOR_HOME"))), so hardcoding
+  # a shared DolphinFS path here would silently override the *local* per-node/
+  # container cache path (AI2THOR_HOME) that hope/launch_*_benchmark.sh exports via
+  # seed_local_ai2thor_cache(). That reintroduces the cross-node fcntl.lockf()
+  # deadlock in ai2thor/util/lock.py (Controller() calling self._build.lock_sh())
+  # -- the exact "stuck forever right after AI2ThorEnvWrapper.__init__ starting,
+  # heartbeat forever, no further log lines" symptom. Let it fall back to the
+  # AI2THOR_HOME env var (local disk) instead; if you need to override it for a
+  # one-off local run, pass it via the AI2THOR_HOME/AI2THOR_LOCAL_HOME env vars,
+  # not here.
+
+max_steps: 30
+
+context_management:
+  enable_long_term_summary: false
+  short_term_history_window_size: 49
+
+dual_agent:
+  equal_collaboration: true
+  collaboration_mode: alternating
+  switch_interval: 1
+  max_global_steps: 60
+
+model:
+  vlm:
+    provider: openai
+    model_name: gpt-5.5
+    temperature: 1.0
+    top_p: 0.9
+    max_tokens: 4096
+    base_url: https://aigc.sankuai.com/v1/openai/native
+    api_key: "2011286628471992379"
+
+logging:
+  stdout_verbose: true
+  save_step_images: true
+
+actions:
+  move_small_magnitude: 0.25
+  move_medium_magnitude: 0.5
+  move_large_magnitude: 1
+  move_ahead_magnitude: 0.5
+  move_back_magnitude: 0.5
+  move_left_magnitude: 0.5
+  move_right_magnitude: 0.5
+  rotate_degrees: 90
+
+reward:
+  success_reward: 10.0
+  step_success_bonus: 0.1
+  step_failure_penalty: -0.05
+
+experiment:
+  num_episodes: 1
+  output_dir: outputs
+
+task_presets:
+  open_fridge:
+    scene: FloorPlan1
+    description: You are now in a kitchen scene, please look around like a person to find the fridge, then walk to the front of the fridge, and finally try to open the fridge door.
+    target_object_types: [Fridge]
+    success_condition: {type: object_state, field: isOpen, value: true, any: true}
+    target_description: Find and open any Fridge
+  open_microwave:
+    scene: FloorPlan1
+    description: Find the microwave in the kitchen, walk to the front of it, and then open the microwave door.
+    target_object_types: [Microwave]
+    success_condition: {type: object_state, field: isOpen, value: true, any: true}
+    target_description: Find and open any Microwave
+  close_faucet:
+    scene: FloorPlan1
+    description: Find the open faucet in the kitchen, walk to the front of it, and then close it.
+    target_object_types: [Faucet]
+    success_condition: {type: object_state, field: isToggled, value: false, any: true}
+    target_description: Find and close any open Faucet
+  turn_on_light:
+    scene: FloorPlan10
+    description: Find the light switch in the room, walk to the front of it, and then turn on the light.
+    target_object_types: [LightSwitch]
+    success_condition: {type: object_state, field: isToggled, value: true, any: true}
+    target_description: Find and turn on any LightSwitch
+  pickup_egg:
+    scene: FloorPlan2
+    description: Find the egg (Egg), approach it, and then pick up the egg.
+    target_object_types: [Egg]
+    success_condition: {type: object_in_hand, object_type: Egg}
+    target_description: Find and pick up the egg (Egg)
+    max_steps: 25
+  pickup_phone:
+    scene: FloorPlan2
+    description: Find the phone (Phone), approach it, and then pick up the phone.
+    target_object_types: [Phone]
+    success_condition: {type: object_in_hand, object_type: Phone}
+    target_description: Find and pick up the phone (Phone)
+    max_steps: 25
+  put_egg_in_pan:
+    scene: FloorPlan2
+    description: Find the egg (Egg), pick it up, and then put it into the pan (Pan)
+    target_object_types: [Egg, Pan]
+    success_condition: {type: object_state, field: parentReceptacles, value: Pan, any: true}
+    target_description: Find the egg (Egg), pick it up, and then put it into the pan (Pan)
+    max_steps: 50
+  slice_apple:
+    scene: FloorPlan1
+    description: Find the apple (Apple), slice it
+    target_object_types: [Apple]
+    success_condition: {type: object_state, field: isSliced, value: true, any: true}
+    target_description: Find the apple (Apple), slice it
+    max_steps: 60
+  put_two_eggs_in_pan:
+    scene: FloorPlan2
+    description: Find two eggs and put them both into the pan
+    target_object_types: [Egg, Pan]
+    success_conditions:
+      - type: object_in_receptacle
+        object_type: Egg
+        receptacle_type: Pan
+        count: 2
+        description: Two eggs must be in the pan
+    success_logic: AND
+    target_description: Find two eggs and put them both into the pan
+    max_steps: 80
