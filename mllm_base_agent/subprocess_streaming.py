@@ -108,7 +108,23 @@ def run_task_subprocess_streaming(
                     os.killpg(process.pid, 15)
                     process.wait(timeout=30)
                 except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, 9)
+                    try:
+                        os.killpg(process.pid, 9)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        message = (
+                            "Timed-out task parent did not exit after SIGKILL; "
+                            "continuing without blocking this shard.\n"
+                        )
+                        output_parts.append(message)
+                        live_log.write(message)
+                        print(f"[{task_id}] {message}", end="", flush=True)
+                except ProcessLookupError:
+                    # The child can exit between poll() and killpg(). Reap it below.
+                    process.wait(timeout=30)
                 break
             if now - last_output_at >= heartbeat_seconds:
                 message = f"heartbeat: still running, elapsed={elapsed / 60:.1f} min, pid={process.pid}\n"
@@ -124,12 +140,19 @@ def run_task_subprocess_streaming(
                 )
                 last_output_at = now
 
-        remainder = process.stdout.read()
-        if remainder:
-            output_parts.append(remainder)
-            live_log.write(remainder)
-            for line in remainder.splitlines(keepends=True):
-                print(f"[{task_id}] {line}", end="", flush=True)
+        # A descendant may inherit stdout even after its benchmark parent is killed.
+        # Blocking on read() would then strand the entire shard and prevent its
+        # summary from being written. The live log already contains all output
+        # observed before the timeout, so close the pipe instead.
+        if timed_out:
+            process.stdout.close()
+        else:
+            remainder = process.stdout.read()
+            if remainder:
+                output_parts.append(remainder)
+                live_log.write(remainder)
+                for line in remainder.splitlines(keepends=True):
+                    print(f"[{task_id}] {line}", end="", flush=True)
 
     return_code = 124 if timed_out else process.wait()
     duration = time.time() - started_at
