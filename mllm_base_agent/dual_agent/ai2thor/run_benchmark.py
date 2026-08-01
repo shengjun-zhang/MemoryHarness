@@ -1477,15 +1477,12 @@ Examples:
     else:
         # `failed_model` 是评测层面的正常负样本（例如模型误判 DONE / 达到最大步数），
         # 属于预期内的 benchmark 结果，不应视为进程运行错误。
-        # `failed_api`（限流/超时/413 等 API 波动）同样不应让整个 shard 非零退出：
-        # 这类失败通常只是瞬时的、与当前机器/容器环境无关，任务已写回 CSV 为
-        # null，后续重跑（--skip-completed）会自动补跑，没必要因为个别任务撞上
-        # 一次 API 抖动就让 AFO 判定整个 worker task 失败、杀掉同一 worker 上其它
-        # 正常运行的任务。
-        # 只有 `failed_infra`（环境崩溃 env_error、结果缺失、未捕获异常等）才代表
-        # 本次 shard 运行本身/所在机器出了问题，才需要让进程以非零码退出（供集群
-        # 调度层据此重试/告警/重启容器）。
-        exit_code = 0 if failed_infra == 0 else 1
+        # All task-level outcomes, including timeouts and missing task results,
+        # are persisted in benchmark_summary.json. Returning nonzero here makes
+        # Hope abort sibling shards as soon as one task has an external failure,
+        # destroying otherwise valid distributed results. Scheduler-loop errors
+        # still set exit_code=1 in the exception handlers above.
+        exit_code = 0
     finally:
         if temp_config_path and os.path.exists(temp_config_path):
             try:
