@@ -1856,13 +1856,10 @@ def run_dual_agent_loop(
                     break
                 done_reject_msg = "DONE was rejected by evaluator"
                 current_agent["last_error_message"] = done_reject_msg
+                # A rejected DONE is recoverable: keep this agent active for another evidence-driven action.
+                current_agent["consecutive_failures"] += 1
+                current_agent["memory_consulted_for_streak"] = False
                 print(f"❌ DONE rejected by evaluator (score={score:.2f})")
-                handoff_agent_or_finish(
-                    state,
-                    current_agent_id,
-                    "Model claimed DONE but success conditions were not met",
-                    failure_type="model_error",
-                )
                 continue
 
             handoff_agent_or_finish(
