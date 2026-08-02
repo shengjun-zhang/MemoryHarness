@@ -20,10 +20,10 @@ log_dir =
 [user_args]
 
 [roles]
-workers = 1
+workers = 8
 worker.memory = 100000
 worker.vcore = 16
-worker.script = CSV_FILE=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/worldmodel/SpatialWorld/experiments/csv/ai2thor/ai2thor_single_gpt55_r2_memory_w10.csv CONFIG_FILE=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/worldmodel/SpatialWorld/experiments/configs/ai2thor/config_gpt55_r2_memory_w10.yaml TASK_TIMEOUT_SECONDS=3600 SEQUENTIAL=1 RERUN_ALL=1 SAVE_NAME=ai2thor-single-gpt55-r2-memory-w10 bash launch_single_benchmark.sh ai2thor -w 10
+worker.script = CSV_FILE=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/worldmodel/SpatialWorld/experiments/csv/ai2thor/ai2thor_single_gpt55_r2_memory_w10.csv CONFIG_FILE=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/worldmodel/SpatialWorld/experiments/configs/ai2thor/config_gpt55_r2_memory_w10.yaml TASK_TIMEOUT_SECONDS=3600 SEQUENTIAL=1 RERUN_ALL=1 SAVE_NAME=ai2thor-single-gpt55-r2-memory-w10 bash hope/launch_single_benchmark.sh ai2thor -w 10
 worker.ports = 1
 
 [am]
