@@ -74,10 +74,9 @@ model:
     provider: openai
     model_name: gpt-5.5
     temperature: 1.0
-    top_p: 0.9
     max_tokens: 4096
     base_url: https://aigc.sankuai.com/v1/openai/native
-    api_key: "2011286628471992379"
+    api_key: null
 
 logging:
   stdout_verbose: true
