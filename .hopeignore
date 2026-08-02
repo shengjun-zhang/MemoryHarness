@@ -8,8 +8,3 @@ mllm_base_agent/single_agent/ai2thor/outputs_completed
 mllm_base_agent/single_agent/procthor/benchmark_outputs
 mllm_base_agent/single_agent/procthor/outputs_completed
 outputs
-scripts/ai2thor/benchmark_outputs
-scripts/ai2thor/outputs_completed
-scripts/procthor/benchmark_outputs
-scripts/procthor/outputs_completed
-scripts/embodiedcity/work
