@@ -12,7 +12,7 @@ This ledger keeps GPT-5.5 trials separate from earlier Doubao and constrained GP
 | R0b | ProcTHOR single | 000, 001, 002, 003 | explicitly off | omitted | submitted (Hope 56100913) | pending | pending | Corrected raw baseline |
 | R0b | AI2-THOR dual | 03044, 03054, 03064, 03075 | explicitly off | omitted | submitted (Hope 56101557) | pending | pending | Corrected raw baseline |
 | R0b | ProcTHOR dual | 107, 201, 202, 203 | explicitly off | omitted | submitted (Hope 56101556) | pending | pending | Corrected raw baseline |
-| R1 | AI2-THOR single | 03075 | explicitly off | `w=10` only | pending | pending | pending | Isolate the raw-baseline HTTP 413 failure |
+| R1 | AI2-THOR single | 03075 | explicitly off | `w=10` only | terminal (Hope 56102497) | 0/1 | HTTP 413 eliminated; max steps after 16 actions/turns, 0 communications, 145808 tokens | Add memory only; retain w=10 as required transport mitigation |
 
 The next iteration may add only one harness intervention to an affected branch.
 Memory feedback is considered before image/history restrictions; `k`, `s`, and
