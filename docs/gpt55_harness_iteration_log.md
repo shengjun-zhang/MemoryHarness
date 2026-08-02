@@ -15,7 +15,7 @@ This ledger keeps GPT-5.5 trials separate from earlier Doubao and constrained GP
 | R1 | AI2-THOR single | 03075 | explicitly off | `w=10` only | terminal (Hope 56102497) | 0/1 | HTTP 413 eliminated; max steps after 16 actions/turns, 0 communications, 145808 tokens | Add memory only; retain w=10 as required transport mitigation |
 
 | R2 | AI2-THOR single | 03075 | enabled | `w=10` only | terminal (Hope 56103317) | 0/1 | max steps after 16 actions/turns, 0 communications, 280072 tokens; six memory lookups | Memory doubled token cost versus R1 and did not improve completion; retain `w=10` only as the transport mitigation |
-| R1 | AI2-THOR dual | 03044, 03054, 03064, 03075 | enabled | omitted | submitted | pending | pending | Isolate feedback-memory effect after raw failures made unavailable recovery lookups |
+| R1 | AI2-THOR dual | 03044, 03054, 03064, 03075 | enabled | omitted | submitted (Hope 56107673) | pending | four automatic shards; minimal Hope payload retained /workdir at 127 GB | Isolate feedback-memory effect after raw failures made unavailable recovery lookups |
 The next iteration may add only one harness intervention to an affected branch.
 Memory feedback is considered before image/history restrictions; `k`, `s`, and
 `w` are introduced only after trajectory evidence indicates context-size failure.
