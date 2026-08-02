@@ -1167,6 +1167,8 @@ def run_dual_agent_loop(
             memory_index_block=memory_index_block,
         )
         messages = [SystemMessage(content=system_prompt)]
+        if memory_library is None:
+            system_prompt += "\n\nThis run has no skill-memory library. ReadMemory is unavailable; never output it."
 
         history_feedback = state.get("history_feedback", False)
         llm_history_feedback = state.get("llm_history_feedback", False)
