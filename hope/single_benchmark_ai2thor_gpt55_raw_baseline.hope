@@ -23,7 +23,7 @@ log_dir =
 workers = 1
 worker.memory = 100000
 worker.vcore = 16
-worker.script = CSV_FILE=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/worldmodel/SpatialWorld/experiments/csv/ai2thor/ai2thor_single_gpt55_raw_baseline.csv CONFIG_FILE=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/worldmodel/SpatialWorld/experiments/configs/ai2thor/config_gpt55_raw_baseline.yaml TASK_TIMEOUT_SECONDS=3600 SEQUENTIAL=1 RERUN_ALL=1 SAVE_NAME=ai2thor-single-gpt55-raw-r0 bash launch_single_benchmark.sh ai2thor
+worker.script = CSV_FILE=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/worldmodel/SpatialWorld/experiments/csv/ai2thor/ai2thor_single_gpt55_raw_baseline_r0b.csv CONFIG_FILE=/mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/worldmodel/SpatialWorld/experiments/configs/ai2thor/config_gpt55_raw_baseline.yaml TASK_TIMEOUT_SECONDS=3600 SEQUENTIAL=1 RERUN_ALL=1 SAVE_NAME=ai2thor-single-gpt55-raw-r0b bash launch_single_benchmark.sh ai2thor
 worker.ports = 1
 
 [am]

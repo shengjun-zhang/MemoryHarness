@@ -266,6 +266,8 @@ def _build_memory_nudge_text(state: AgentState) -> Optional[str]:
     episode.
     """
     consecutive_failures = _count_consecutive_failures(state)
+    if state.get("memory_library") is None:
+        return None
     memory_reads_used = int(state.get('memory_reads_used', 0) or 0)
 
     if consecutive_failures <= 0:
@@ -329,6 +331,8 @@ def _build_messages(state: AgentState, image_url: str) -> list:
     memory_block = _memory_index_prompt_block(state)
     if memory_block:
         prompt = f"{prompt}\n\n{memory_block}"
+    elif state.get("memory_library") is None:
+        prompt = f"{prompt}\n\nThis run has no skill-memory library. ReadMemory is unavailable; never output it."
     messages = [SystemMessage(content=prompt)]
     long_term_summary = state.get('long_term_summary', '')
     history = (state.get('short_term_history', []) or [])[-MODEL_HISTORY_TURNS:]
@@ -806,7 +810,7 @@ def lookahead_think_node(state: AgentState) -> AgentState:
 
         raw_action_block = extract_tag_block(response_text or '', 'ACTION')
         memory_file_name = _parse_read_memory_action(raw_action_block or '')
-        if memory_file_name is not None and _memory_lookup_round < max_memory_lookups_per_turn:
+        if memory_file_name is not None and state.get("memory_library") is not None and _memory_lookup_round < max_memory_lookups_per_turn:
             memory_text = _handle_read_memory_action(state, memory_file_name, response_text or '')
             state.setdefault('short_term_history', []).append({
                 'step': state.get('step_count', 0),
@@ -1025,7 +1029,7 @@ def think_node(state: AgentState) -> AgentState:
         # do not know about this pseudo-action and would raise on it).
         raw_action_block = extract_tag_block(response_text or '', 'ACTION')
         memory_file_name = _parse_read_memory_action(raw_action_block or '')
-        if memory_file_name is not None and _memory_lookup_round < max_memory_lookups_per_turn:
+        if memory_file_name is not None and state.get("memory_library") is not None and _memory_lookup_round < max_memory_lookups_per_turn:
             memory_text = _handle_read_memory_action(state, memory_file_name, response_text or '')
             state.setdefault('short_term_history', []).append({
                 'step': state.get('step_count', 0),
@@ -1266,6 +1270,8 @@ def _should_force_read_memory(state: AgentState, memory_consulted_this_turn: boo
     (see callers) -- once it has, the gate lets a real action through even if
     the trajectory-level consecutive-failure count hasn't changed yet.
     """
+    if state.get("memory_library") is None:
+        return False
     if memory_consulted_this_turn:
         return False
     return _count_consecutive_failures(state) >= FORCE_READ_MEMORY_FAILURE_THRESHOLD

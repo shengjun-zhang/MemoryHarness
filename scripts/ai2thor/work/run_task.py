@@ -812,7 +812,8 @@ Example usage:
                 # intercepted in mllm_base_agent/agent/runner.py. Degrades
                 # gracefully to "no memory available" for env types that do
                 # not (yet) have a single_agent/<env>/core/memory/ library.
-                "memory_library": MemoryLibrary.for_env(env_type, agent_mode="single"),
+                "memory_library": MemoryLibrary.for_env(env_type, agent_mode="single")
+                if bool((config.get_all().get("memory") or {}).get("enabled", True)) else None,
             }
 
             # Run Agent graph

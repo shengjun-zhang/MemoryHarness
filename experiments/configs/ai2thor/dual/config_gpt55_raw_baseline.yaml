@@ -22,6 +22,8 @@ dual_agent:
   collaboration_mode: alternating
   switch_interval: 1
   max_global_steps: 60
+memory:
+  enabled: false
 model:
   vlm:
     provider: openai

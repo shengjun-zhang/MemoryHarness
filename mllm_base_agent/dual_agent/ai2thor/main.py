@@ -1244,7 +1244,7 @@ def run_dual_agent_loop(
         # on demand via the ReadMemory(<file_name>) pseudo-action, which this
         # loop intercepts below (see the "memory_lookup" branch) instead of
         # forwarding it to the AI2-THOR environment.
-        "memory_library": MemoryLibrary.for_env("ai2thor", agent_mode="dual"),
+        "memory_library": MemoryLibrary.for_env("ai2thor", agent_mode="dual") if bool((config.get("memory") or {}).get("enabled", True)) else None,
         "history_feedback": bool(config.get("dual_agent", {}).get("history_feedback", False)),
         "llm_history_feedback": bool(
             config.get("dual_agent", {}).get("llm_history_feedback", False)
@@ -1695,7 +1695,7 @@ def run_dual_agent_loop(
         # rejection message on its immediate next turn. Bounded by
         # FORCE_READ_MEMORY_MAX_REJECTIONS so a model that still refuses to
         # comply does not burn the whole iteration_cap on one stuck turn.
-        if action_dict.get("action_type") != "memory_lookup" and _should_force_read_memory(current_agent):
+        if state.get("memory_library") is not None and action_dict.get("action_type") != "memory_lookup" and _should_force_read_memory(current_agent):
             current_agent["forced_memory_rejections"] = current_agent.get("forced_memory_rejections", 0) + 1
             rejection_text = _force_read_memory_rejection_text(current_agent)
             print(f"🚫 {rejection_text}")

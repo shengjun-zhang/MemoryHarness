@@ -17,6 +17,8 @@ env:
   https_proxy: http://10.70.18.228:8412
   ai2thor_ld_library_path: /mnt/dolphinfs/ssd_pool/docker/user/hadoop-videogen-hl/hadoop-camera3d/zhangshengjun/conda-envs/spatialworld-ai2thor/lib
 max_steps: 30
+memory:
+  enabled: false
 model:
   vlm:
     provider: openai

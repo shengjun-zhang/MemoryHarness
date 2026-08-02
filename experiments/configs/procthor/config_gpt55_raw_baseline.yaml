@@ -13,6 +13,8 @@ env:
   agent_count: 1
   platform: null
 max_steps: 30
+memory:
+  enabled: false
 model:
   vlm:
     provider: openai

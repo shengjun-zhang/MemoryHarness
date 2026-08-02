@@ -1095,7 +1095,7 @@ def run_dual_agent_loop(
         # feedback_*.md leaf notes. The index is embedded into the system
         # prompt every turn; leaf notes are fetched on demand via the
         # ReadMemory(<file_name>) pseudo-action intercepted below.
-        "memory_library": MemoryLibrary.for_env("procthor", agent_mode="dual"),
+        "memory_library": MemoryLibrary.for_env("procthor", agent_mode="dual") if bool((config.get("memory") or {}).get("enabled", True)) else None,
         "history_feedback": bool(config.get("dual_agent", {}).get("history_feedback", False)),
         "llm_history_feedback": bool(config.get("dual_agent", {}).get("llm_history_feedback", False)),
         # Image downscale factor for VLM inputs (``image.scale``). 1.0 = no scaling.
@@ -1475,7 +1475,7 @@ def run_dual_agent_loop(
         # not executed, no step consumed, no handoff -- and the agent is
         # re-prompted with an explicit rejection message on its immediate
         # next turn. Bounded by FORCE_READ_MEMORY_MAX_REJECTIONS.
-        if action_dict.get("action_type") != "memory_lookup" and _should_force_read_memory(current_agent):
+        if state.get("memory_library") is not None and action_dict.get("action_type") != "memory_lookup" and _should_force_read_memory(current_agent):
             current_agent["forced_memory_rejections"] = current_agent.get("forced_memory_rejections", 0) + 1
             rejection_text = _force_read_memory_rejection_text(current_agent)
             print(f"🚫 {rejection_text}")
