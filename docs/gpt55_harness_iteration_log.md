@@ -10,11 +10,12 @@ This ledger keeps GPT-5.5 trials separate from earlier Doubao and constrained GP
 | R0 | ProcTHOR dual | 107, 201, 202, 203 | off | omitted | pending | pending | pending | Raw baseline |
 | R0b | AI2-THOR single | 03044, 03054, 03064, 03075 | explicitly off | omitted | terminal (Hope 56100914) | 0/4 | max steps: 2; premature DONE: 1; HTTP 413: 1. 48 actions, 48 turns, 0 communications, 418600 tokens | Test only `-w 10` on the 413 task |
 | R0b | ProcTHOR single | 000, 001, 002, 003 | explicitly off | omitted | submitted (Hope 56100913) | pending | pending | Corrected raw baseline |
-| R0b | AI2-THOR dual | 03044, 03054, 03064, 03075 | explicitly off | omitted | submitted (Hope 56101557) | pending | pending | Corrected raw baseline |
+| R0b | AI2-THOR dual | 03044, 03054, 03064, 03075 | explicitly off | omitted | terminal (Hope 56101557) | 1/4 | max steps: 3. 113 actions, 109 turns, 172 communications; 0 API/infra failures | Raw coordination succeeded only on 03064; enable memory feedback as the next single-variable test because failed trajectories repeatedly attempted unavailable recovery lookups |
 | R0b | ProcTHOR dual | 107, 201, 202, 203 | explicitly off | omitted | submitted (Hope 56101556) | pending | pending | Corrected raw baseline |
 | R1 | AI2-THOR single | 03075 | explicitly off | `w=10` only | terminal (Hope 56102497) | 0/1 | HTTP 413 eliminated; max steps after 16 actions/turns, 0 communications, 145808 tokens | Add memory only; retain w=10 as required transport mitigation |
 
-| R2 | AI2-THOR single | 03075 | enabled | `w=10` only | submitted (Hope 56103317) | pending | pending | Isolate memory harness effect after the transport fix |
+| R2 | AI2-THOR single | 03075 | enabled | `w=10` only | terminal (Hope 56103317) | 0/1 | max steps after 16 actions/turns, 0 communications, 280072 tokens; six memory lookups | Memory doubled token cost versus R1 and did not improve completion; retain `w=10` only as the transport mitigation |
+| R1 | AI2-THOR dual | 03044, 03054, 03064, 03075 | enabled | omitted | submitted | pending | pending | Isolate feedback-memory effect after raw failures made unavailable recovery lookups |
 The next iteration may add only one harness intervention to an affected branch.
 Memory feedback is considered before image/history restrictions; `k`, `s`, and
 `w` are introduced only after trajectory evidence indicates context-size failure.
