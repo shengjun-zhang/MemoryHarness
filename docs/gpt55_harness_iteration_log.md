@@ -8,8 +8,8 @@ This ledger keeps GPT-5.5 trials separate from earlier Doubao and constrained GP
 | R0a | ProcTHOR single | 000, 001, 002, 003 | not verified | omitted | stopped (Hope 56099973) | invalid | no completed trajectory | Stopped with the same faulty baseline definition |
 | R0 | AI2-THOR dual | 03044, 03054, 03064, 03075 | off | omitted | pending | pending | pending | Raw baseline |
 | R0 | ProcTHOR dual | 107, 201, 202, 203 | off | omitted | pending | pending | pending | Raw baseline |
-| R0b | AI2-THOR single | 03044, 03054, 03064, 03075 | explicitly off | omitted | pending | pending | pending | Corrected raw baseline |
-| R0b | ProcTHOR single | 000, 001, 002, 003 | explicitly off | omitted | pending | pending | pending | Corrected raw baseline |
+| R0b | AI2-THOR single | 03044, 03054, 03064, 03075 | explicitly off | omitted | submitted (Hope 56100914) | pending | pending | Corrected raw baseline |
+| R0b | ProcTHOR single | 000, 001, 002, 003 | explicitly off | omitted | submitted (Hope 56100913) | pending | pending | Corrected raw baseline |
 | R0b | AI2-THOR dual | 03044, 03054, 03064, 03075 | explicitly off | omitted | pending | pending | pending | Corrected raw baseline |
 | R0b | ProcTHOR dual | 107, 201, 202, 203 | explicitly off | omitted | pending | pending | pending | Corrected raw baseline |
 
