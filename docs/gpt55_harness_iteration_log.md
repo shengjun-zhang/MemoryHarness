@@ -8,10 +8,11 @@ This ledger keeps GPT-5.5 trials separate from earlier Doubao and constrained GP
 | R0a | ProcTHOR single | 000, 001, 002, 003 | not verified | omitted | stopped (Hope 56099973) | invalid | no completed trajectory | Stopped with the same faulty baseline definition |
 | R0 | AI2-THOR dual | 03044, 03054, 03064, 03075 | off | omitted | pending | pending | pending | Raw baseline |
 | R0 | ProcTHOR dual | 107, 201, 202, 203 | off | omitted | pending | pending | pending | Raw baseline |
-| R0b | AI2-THOR single | 03044, 03054, 03064, 03075 | explicitly off | omitted | submitted (Hope 56100914) | pending | pending | Corrected raw baseline |
+| R0b | AI2-THOR single | 03044, 03054, 03064, 03075 | explicitly off | omitted | terminal (Hope 56100914) | 0/4 | max steps: 2; premature DONE: 1; HTTP 413: 1. 48 actions, 48 turns, 0 communications, 418600 tokens | Test only `-w 10` on the 413 task |
 | R0b | ProcTHOR single | 000, 001, 002, 003 | explicitly off | omitted | submitted (Hope 56100913) | pending | pending | Corrected raw baseline |
 | R0b | AI2-THOR dual | 03044, 03054, 03064, 03075 | explicitly off | omitted | submitted (Hope 56101557) | pending | pending | Corrected raw baseline |
 | R0b | ProcTHOR dual | 107, 201, 202, 203 | explicitly off | omitted | submitted (Hope 56101556) | pending | pending | Corrected raw baseline |
+| R1 | AI2-THOR single | 03075 | explicitly off | `w=10` only | pending | pending | pending | Isolate the raw-baseline HTTP 413 failure |
 
 The next iteration may add only one harness intervention to an affected branch.
 Memory feedback is considered before image/history restrictions; `k`, `s`, and
