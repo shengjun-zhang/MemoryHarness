@@ -4,8 +4,8 @@ This ledger keeps GPT-5.5 trials separate from earlier Doubao and constrained GP
 
 | Iteration | Branch | Task set | Memory feedback | Launcher `k/s/w` | Status | Success | Failure / cost | Decision |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| R0 | AI2-THOR single | 03044, 03054, 03064, 03075 | off | omitted | pending | pending | pending | Raw baseline |
-| R0 | ProcTHOR single | 000, 001, 002, 003 | off | omitted | pending | pending | pending | Raw baseline |
+| R0 | AI2-THOR single | 03044, 03054, 03064, 03075 | off | omitted | running (Hope 56099972) | pending | pending | Raw baseline |
+| R0 | ProcTHOR single | 000, 001, 002, 003 | off | omitted | running (Hope 56099973) | pending | pending | Raw baseline |
 | R0 | AI2-THOR dual | 03044, 03054, 03064, 03075 | off | omitted | pending | pending | pending | Raw baseline |
 | R0 | ProcTHOR dual | 107, 201, 202, 203 | off | omitted | pending | pending | pending | Raw baseline |
 
